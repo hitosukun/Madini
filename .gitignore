@@ -1,0 +1,50 @@
+# macOS
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+
+# Runtime and generated app data
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-shm
+*.db-wal
+history.json
+Current_View.html
+
+# Imported conversation logs (safety-first)
+*.json
+*.md
+*.markdown
+!README.md
+
+# Personal logs and local working data
+imports/
+data/
+logs/
+exports/
+chatlogs/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.secret
+
+# Editor / tooling
+.vscode/
+.idea/
+*.log
