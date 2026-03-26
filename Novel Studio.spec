@@ -21,7 +21,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Novel Studio',
+    name='Madini - Local Archive Browser',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -41,11 +41,11 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='Novel Studio',
+    name='Madini - Local Archive Browser',
 )
 app = BUNDLE(
     coll,
-    name='Novel Studio.app',
+    name='Madini - Local Archive Browser.app',
     icon='Madini.icns',
     bundle_identifier=None,
 )

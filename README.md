@@ -1,6 +1,6 @@
-# Madini Novel Studio
+# Madini - Local Archive Browser
 
-Madini Novel Studio は、ChatGPT / Claude / Gemini などの会話ログを取り込み、共通スキーマで SQLite に保存して、あとから検索・閲覧できる Python 製デスクトップツールです。  
+Madini - Local Archive Browser は、ChatGPT / Claude / Gemini などの会話ログを取り込み、共通スキーマで SQLite に保存して、あとから検索・閲覧できる Python 製デスクトップツールです。  
 GUI は `madini_gui.py`、取り込みと正規化は `split_chatlog.py` が担当します。
 
 private repository 前提で継続開発しやすいように、ソースコードと静的アセットは Git 管理し、個人の会話ログや生成済みデータは Git 管理から除外する想定です。

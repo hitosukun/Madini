@@ -126,11 +126,11 @@ def build_viewer_index_script(index):
     return f"window.__CHAT_INDEX__ = {_escape_json(index)};\nwindow.__CHAT_DETAILS__ = window.__CHAT_DETAILS__ || {{}};\n"
 
 
-def _build_theme_buttons(themes):
+def _build_theme_buttons(themes, scope="inline"):
     return "".join(
         [
             (
-                f"<button id=\"btn-theme-{key}\" class=\"theme-btn\" "
+                f"<button class=\"theme-btn\" data-theme-btn=\"{scope}\" data-theme-key=\"{key}\" "
                 f"onclick=\"switchTheme('{key}')\" "
                 f"style=\"background-color: {value['color']};\"></button>"
             )
@@ -142,6 +142,7 @@ def _build_theme_buttons(themes):
 def build_viewer_html(conversations, user_themes=None, system_theme="light", show_toast=False):
     themes = merge_themes(user_themes)
     css_text = _read_text(ASSET_DIR / "style.css")
+    css_text += "\n" + _read_text(ASSET_DIR / "math.css")
     js_text = _read_text(ASSET_DIR / "viewer.js")
 
     if CUSTOM_CSS.exists():
@@ -170,58 +171,176 @@ def build_viewer_html(conversations, user_themes=None, system_theme="light", sho
 <body>
 <div id="sidebar">
     <div class="sidebar-header">
-        <div class="search-container">
-            <input type="text" id="searchBar" onkeypress="if(event.key === 'Enter') executeSearch()">
-            <button class="action-btn" onclick="executeSearch()">検索</button>
+        <div class="sidebar-mode-switch" role="tablist" aria-label="左ペインモード">
+            <button id="sidebar-mode-threads" class="sidebar-mode-btn active" type="button" role="tab" aria-selected="true" onclick="switchSidebarMode('threads')"><span class="sidebar-mode-btn-icon" aria-hidden="true">📁</span><span>ディレクトリ</span></button>
+            <button id="sidebar-mode-extract" class="sidebar-mode-btn" type="button" role="tab" aria-selected="false" onclick="switchSidebarMode('extract')"><span class="sidebar-mode-btn-icon sidebar-mode-btn-icon-filter" aria-hidden="true"></span><span>フィルタ</span></button>
         </div>
-        <div class="search-options">
-            <div class="search-targets">
-                <label class="search-target-label"><input type="checkbox" id="chk-title" checked onchange="handleSearchTargetChange()"> <span class="search-target-pill">タイトル</span></label>
-                <label class="search-target-label"><input type="checkbox" id="chk-prompt" checked onchange="handleSearchTargetChange()"> <span class="search-target-pill">プロンプト</span></label>
-                <label class="search-target-label"><input type="checkbox" id="chk-answer" checked onchange="handleSearchTargetChange()"> <span class="search-target-pill">回答</span></label>
-            </div>
-            <div class="sort-options">
-                <select id="sort-select" onchange="executeSearch()">
-                    <option value="date-desc">日付(新)</option>
-                    <option value="date-asc">日付(古)</option>
-                    <option value="original">標準</option>
-                    <option value="hits-desc">ヒット数(降)</option>
-                    <option value="title-asc">五十音(昇)</option>
-                </select>
-            </div>
-        </div>
+        <div id="thread-list-panel" class="sidebar-panel active">
         <div class="tree-actions">
-            <button id="tree-expand-toggle" class="icon-toggle branch-toggle-button" type="button" onclick="toggleAllTreesButton()" title="ツリー全体の開閉を切り替え">
+            <button id="tree-expand-toggle" class="icon-toggle branch-toggle-button" type="button" onclick="toggleAllTreesButton()" title="通常表示: 会話ごとに開閉" aria-pressed="false">
                 <span class="branch-toggle-icon" aria-hidden="true">
                     <span class="branch-caret"></span>
                 </span>
+                <span class="branch-toggle-label" aria-hidden="true">個別</span>
             </button>
             <label class="filter-toggle">
                 <input type="checkbox" id="sidebar-filter-toggle" onchange="toggleSidebarFilter(this.checked)">
-                <span class="toggle-slider"></span>ヒットのみ
+                <span class="toggle-slider"></span>フィルタを反映
             </label>
         </div>
+        <div id="index-tree"></div>
+        </div>
+        <div id="extract-panel" class="sidebar-panel">
+            <div class="extract-form">
+                <div class="extract-summary extract-summary-top" title="Preview count and date-based sort use the same primary time rule.">
+                    <div class="extract-summary-head">
+                        <div class="extract-summary-copy">
+                            <div class="extract-hit-count" title="Primary time: source_created_at, then imported_at, then date_str."><span id="extract-hit-count">0</span> 件</div>
+                            <div class="extract-summary-note" title="Preview count and date sort use primary time.">preview / sort also use primary time</div>
+                        </div>
+                        <div class="extract-summary-actions">
+                            <button class="action-btn header-icon-btn extract-summary-icon-btn" type="button" title="タブで開く" aria-label="タブで開く" onclick="openVirtualThreadFromFilters()">↗</button>
+                            <button class="action-btn secondary-btn header-icon-btn extract-summary-icon-btn" type="button" title="条件をクリア" aria-label="条件をクリア" onclick="clearVirtualThreadFilters()">×</button>
+                        </div>
+                    </div>
+                    <div id="extract-active-filters" class="extract-active-filters"></div>
+                </div>
+                <div class="extract-grid">
+                    <div class="extract-field extract-field-wide">
+                        <span>service</span>
+                        <input type="hidden" id="extract-service" value="[]">
+                        <div id="extract-service-buttons" class="extract-service-buttons"></div>
+                    </div>
+                    <div class="extract-field extract-field-wide">
+                        <span>model</span>
+                        <input type="hidden" id="extract-model" value="[]">
+                        <div id="extract-model-picker" class="extract-model-picker">
+                            <button id="extract-model-trigger" class="extract-picker-trigger" type="button" onclick="toggleExtractModelMenu(event)">
+                                <span id="extract-model-trigger-label">serviceを選ぶ</span>
+                                <span class="extract-picker-caret" aria-hidden="true"></span>
+                            </button>
+                            <div id="extract-model-menu" class="extract-model-menu"></div>
+                        </div>
+                    </div>
+                    <div class="extract-field extract-field-wide extract-date-row">
+                        <label class="extract-field">
+                            <span>date from</span>
+                            <input type="date" id="extract-date-from" onchange="scheduleVirtualThreadPreview()">
+                        </label>
+                        <label class="extract-field">
+                            <span>date to</span>
+                            <input type="date" id="extract-date-to" onchange="scheduleVirtualThreadPreview()">
+                        </label>
+                    </div>
+                    <div
+                        class="extract-date-note extract-field-wide"
+                        title="Date filter uses primary time: source_created_at, then imported_at, then date_str."
+                    >date filter uses primary time: source_created_at -> imported_at -> date_str</div>
+                    <label class="extract-field extract-field-wide">
+                        <span>title</span>
+                        <input type="text" id="extract-title" oninput="scheduleVirtualThreadPreview()">
+                    </label>
+                    <label class="extract-field extract-field-wide">
+                        <span>prompt</span>
+                        <textarea id="extract-prompt" rows="2" oninput="scheduleVirtualThreadPreview()"></textarea>
+                    </label>
+                    <label class="extract-field extract-field-wide">
+                        <span>response</span>
+                        <textarea id="extract-response" rows="2" oninput="scheduleVirtualThreadPreview()"></textarea>
+                    </label>
+                    <label class="extract-field">
+                        <span>source file</span>
+                        <input type="text" id="extract-source-file" list="extract-source-file-options" oninput="scheduleVirtualThreadPreview()">
+                        <datalist id="extract-source-file-options"></datalist>
+                    </label>
+                    <label class="extract-field">
+                        <span>sort</span>
+                        <input type="hidden" id="extract-sort" value="date-asc">
+                        <button id="extract-sort-toggle" class="extract-cycle-btn extract-sort-toggle" type="button" onclick="toggleExtractSort(event)">
+                            <span class="extract-sort-icon" aria-hidden="true"></span>
+                            <span id="extract-sort-toggle-label">昇順</span>
+                        </button>
+                    </label>
+                    <label class="extract-field">
+                        <span>bookmark</span>
+                        <select id="extract-bookmarked" onchange="scheduleVirtualThreadPreview()">
+                            <option value="all">all</option>
+                            <option value="bookmarked">bookmarked only</option>
+                            <option value="not-bookmarked">not bookmarked</option>
+                        </select>
+                    </label>
+                </div>
+                <section class="extract-history-section" aria-labelledby="extract-saved-view-title">
+                    <div class="extract-history-header">
+                        <div class="extract-history-heading">
+                            <h3 id="extract-saved-view-title">Saved Views</h3>
+                            <div class="extract-history-note">named filter definitions</div>
+                        </div>
+                        <button class="extract-history-btn" type="button" onclick="saveCurrentSavedView()">Save Current View</button>
+                    </div>
+                    <div id="extract-saved-view-list" class="extract-history-list">
+                        <div class="extract-history-empty">まだ saved view はないよ</div>
+                    </div>
+                </section>
+                <section class="extract-history-section" aria-labelledby="extract-bookmark-title">
+                    <div class="extract-history-header">
+                        <div class="extract-history-heading">
+                            <h3 id="extract-bookmark-title">Bookmarks</h3>
+                            <div class="extract-history-note">generic target list</div>
+                        </div>
+                    </div>
+                    <div id="extract-bookmark-list" class="extract-history-list">
+                        <div class="extract-history-empty">まだ bookmark はないよ</div>
+                    </div>
+                </section>
+                <section class="extract-history-section" aria-labelledby="extract-history-title">
+                    <div class="extract-history-header">
+                        <div class="extract-history-heading">
+                            <h3 id="extract-history-title">Recent Filters</h3>
+                            <div class="extract-history-note">lightweight reuse history</div>
+                        </div>
+                    </div>
+                    <div id="extract-history-list" class="extract-history-list">
+                        <div class="extract-history-empty">まだフィルタ履歴はないよ</div>
+                    </div>
+                </section>
+            </div>
+        </div>
     </div>
-    <div id="index-tree"></div>
 </div>
-<div id="resizer">
-    <button id="sidebar-toggle" class="icon-toggle sidebar-toggle-button boundary-sidebar-toggle" type="button" onclick="toggleSidebarVisibilityButton()" title="サイドバーを隠す" data-direction="left" aria-label="サイドバーを隠す"></button>
-</div>
+<div id="resizer" aria-hidden="true"></div>
 <div id="chat-viewer" data-current-conv="">
     <div style="text-align:center; margin-top:150px; color:#999;">左のツリーから物語を読み返そう</div>
 </div>
 <div id="toast" class="toast" aria-live="polite"></div>
 
-<template id="viewer-controls-template">
+<template id="viewer-controls-inline-template">
     <div class="viewer-header-controls">
-        <div class="theme-selector viewer-theme-selector">{_build_theme_buttons(themes)}</div>
+        <div class="theme-selector viewer-theme-selector">{_build_theme_buttons(themes, "inline")}</div>
         <div class="utility-toggles viewer-utility-toggles">
-            <button id="mode-toggle" class="icon-toggle header-view-toggle" type="button" onclick="toggleColorMode()" title="明暗を切り替え">☀︎</button>
-            <button id="text-size-toggle" class="icon-toggle text-size-toggle-button header-view-toggle" type="button" onclick="toggleTextSizeButton()" title="文字サイズを切り替え">
+            <button class="icon-toggle header-view-toggle" data-view-setting="mode" type="button" onclick="toggleColorMode()" title="明暗を切り替え">☀︎</button>
+            <button class="icon-toggle text-size-toggle-button header-view-toggle" data-view-setting="text-size" type="button" onclick="toggleTextSizeButton()" title="文字サイズを切り替え">
                 <span class="size-toggle-icon" aria-hidden="true">
                     <span class="size-a size-a-large">A</span>
                     <span class="size-a size-a-small">A</span>
                 </span>
+            </button>
+        </div>
+    </div>
+</template>
+
+<template id="viewer-controls-menu-template">
+    <div class="viewer-settings-section">
+        <div class="viewer-settings-section-label">Appearance</div>
+        <div class="theme-selector viewer-theme-selector viewer-theme-selector-menu">{_build_theme_buttons(themes, "menu")}</div>
+        <div class="utility-toggles viewer-utility-toggles viewer-utility-toggles-menu">
+            <button class="icon-toggle header-view-toggle viewer-menu-toggle" data-view-setting="mode" type="button" onclick="toggleColorMode()" title="明暗を切り替え"><span class="viewer-menu-toggle-icon">☀︎</span><span>表示モード</span></button>
+            <button class="icon-toggle text-size-toggle-button header-view-toggle viewer-menu-toggle" data-view-setting="text-size" type="button" onclick="toggleTextSizeButton()" title="文字サイズを切り替え">
+                <span class="size-toggle-icon" aria-hidden="true">
+                    <span class="size-a size-a-large">A</span>
+                    <span class="size-a size-a-small">A</span>
+                </span>
+                <span>文字サイズ</span>
             </button>
         </div>
     </div>

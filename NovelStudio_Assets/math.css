@@ -1,0 +1,112 @@
+.conversation-root-prompt .math-display {
+    margin: 0.3em 0;
+}
+
+.math-inline,
+.math-display {
+    font-family: "STIX Two Math", "Cambria Math", "Times New Roman", serif;
+    color: inherit;
+}
+
+.math-inline {
+    display: inline-block;
+    max-width: 100%;
+    vertical-align: -0.08em;
+    white-space: nowrap;
+}
+
+.math-display {
+    display: block;
+    margin: 0.55em 0;
+    padding: 0.2em 0;
+    overflow-x: auto;
+    white-space: nowrap;
+}
+
+.math-content {
+    line-height: 1.4;
+    font-size: 1.06em;
+}
+
+.math-inline .math-content {
+    display: inline-block;
+}
+
+.math-display .math-content {
+    display: inline-block;
+    min-width: max-content;
+}
+
+.math-frac {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: stretch;
+    vertical-align: middle;
+    margin: 0 0.12em;
+    text-align: center;
+    line-height: 1.05;
+}
+
+.math-frac-num {
+    display: block;
+    padding: 0 0.2em 0.08em;
+    border-bottom: 1px solid currentColor;
+}
+
+.math-frac-den {
+    display: block;
+    padding: 0.08em 0.2em 0;
+}
+
+.math-sqrt {
+    display: inline-flex;
+    align-items: flex-start;
+    vertical-align: middle;
+}
+
+.math-sqrt-sign {
+    font-size: 1.12em;
+    line-height: 1;
+    padding-right: 0.04em;
+}
+
+.math-sqrt-body {
+    display: inline-block;
+    border-top: 1px solid currentColor;
+    padding: 0.08em 0.12em 0;
+}
+
+.math-text {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif;
+    font-size: 0.95em;
+}
+
+.math-inline sup,
+.math-inline sub,
+.math-display sup,
+.math-display sub {
+    font-size: 0.72em;
+    line-height: 0;
+    position: relative;
+}
+
+.math-inline sup,
+.math-display sup {
+    top: -0.45em;
+}
+
+.math-inline sub,
+.math-display sub {
+    bottom: -0.1em;
+}
+
+.math-fallback .math-content {
+    font-size: 0.96em;
+}
+
+.math-tex-raw {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: color-mix(in srgb, var(--text-color) 90%, var(--accent-color));
+}
