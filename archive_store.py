@@ -5,15 +5,19 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-from app_paths import DB_FILE, HISTORY_FILE, THEMES_JSON, USER_DATA_DIR
+from app_paths import DB_FILE, HISTORY_FILE, THEMES_JSON, USER_DATA_DIR, migrate_legacy_user_data_dir
 
 
 def ensure_user_data_dir() -> None:
+    migrate_legacy_user_data_dir()
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def init_db(db_file=DB_FILE):
-    Path(db_file).parent.mkdir(parents=True, exist_ok=True)
+    if Path(db_file) == DB_FILE:
+        ensure_user_data_dir()
+    else:
+        Path(db_file).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
     cursor.execute(
@@ -1735,6 +1739,208 @@ def _build_virtual_thread_where(filters, has_bookmarks_table=True, primary_time_
 
     where_sql = " AND ".join(clauses) if clauses else "1=1"
     return where_sql, params, used_optional_columns
+
+
+def _build_virtual_thread_conversation_where(
+    filters,
+    has_bookmarks_table=True,
+    table_alias="c",
+    primary_time_expr="",
+):
+    clauses = []
+    params = []
+    used_optional_columns = set()
+
+    filters = _normalize_virtual_thread_filters(filters)
+    services = _normalize_filter_values(filters.get("service"))
+    models = _normalize_filter_values(filters.get("model"))
+    source_file = (filters.get("sourceFile") or "").strip()
+    date_from = (filters.get("dateFrom") or "").strip()
+    date_to = (filters.get("dateTo") or "").strip()
+    title_contains = (filters.get("titleContains") or "").strip()
+    bookmarked = _normalize_bookmarked_filter(filters.get("bookmarked"))
+
+    if services:
+        clauses.append(
+            "COALESCE({alias}.source, '') IN ({values})".format(
+                alias=table_alias,
+                values=", ".join("?" for _ in services),
+            )
+        )
+        params.extend(services)
+
+    if models:
+        used_optional_columns.add("model")
+        clauses.append(
+            "LOWER(COALESCE({alias}.model, '')) IN ({values})".format(
+                alias=table_alias,
+                values=", ".join("?" for _ in models),
+            )
+        )
+        params.extend([model.lower() for model in models])
+
+    if source_file:
+        used_optional_columns.add("source_file")
+        clause, clause_params = _build_contains_clause(f"{table_alias}.source_file", source_file)
+        clauses.append(clause)
+        params.extend(clause_params)
+
+    if primary_time_expr:
+        if date_from:
+            clauses.append(f"substr(COALESCE({primary_time_expr}, ''), 1, 10) >= ?")
+            params.append(date_from)
+        if date_to:
+            clauses.append(f"substr(COALESCE({primary_time_expr}, ''), 1, 10) <= ?")
+            params.append(date_to)
+
+    if title_contains:
+        clause, clause_params = _build_contains_clause(f"{table_alias}.title", title_contains)
+        clauses.append(clause)
+        params.extend(clause_params)
+
+    if bookmarked == "bookmarked":
+        if has_bookmarks_table:
+            clauses.append(
+                f"""
+                EXISTS (
+                    SELECT 1
+                    FROM bookmarks b
+                    WHERE b.target_type = 'thread'
+                      AND b.target_id = {table_alias}.id
+                )
+                """
+            )
+        else:
+            clauses.append("1=0")
+    elif bookmarked == "not-bookmarked" and has_bookmarks_table:
+        clauses.append(
+            f"""
+            NOT EXISTS (
+                SELECT 1
+                FROM bookmarks b
+                WHERE b.target_type = 'thread'
+                  AND b.target_id = {table_alias}.id
+            )
+            """
+        )
+
+    where_sql = " AND ".join(clauses) if clauses else "1=1"
+    return where_sql, params, used_optional_columns
+
+
+def build_virtual_thread_preview(filters, db_file=DB_FILE):
+    filters = _normalize_virtual_thread_filters(filters)
+    if not db_file.exists():
+        return {
+            "title": _build_virtual_thread_title(filters),
+            "itemCount": 0,
+            "filters": filters,
+            "conversationIds": [],
+        }
+
+    conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    _model_expr, _source_file_expr, columns = _conversation_select_fragment(cursor, "c")
+    primary_time_expr = _conversation_primary_time_expr(columns, "c")
+    conversation_where_sql, params, used_optional_columns = _build_virtual_thread_conversation_where(
+        filters,
+        has_bookmarks_table=_table_exists(cursor, "bookmarks"),
+        table_alias="c",
+        primary_time_expr=primary_time_expr,
+    )
+    if any(column not in columns for column in used_optional_columns):
+        conn.close()
+        return {
+            "title": _build_virtual_thread_title(filters),
+            "itemCount": 0,
+            "filters": filters,
+            "conversationIds": [],
+        }
+
+    prompt_contains = (filters.get("promptContains") or "").strip()
+    response_contains = (filters.get("responseContains") or "").strip()
+    roles = _normalize_filter_values(filters.get("role"))
+    role_set = {role.lower() for role in roles}
+
+    if role_set and role_set.isdisjoint({"user", "assistant"}):
+        conn.close()
+        return {
+            "title": _build_virtual_thread_title(filters),
+            "itemCount": 0,
+            "filters": filters,
+            "conversationIds": [],
+        }
+
+    turn_clauses = [conversation_where_sql] if conversation_where_sql else []
+    turn_params = list(params)
+
+    if prompt_contains:
+        clause, clause_params = _build_contains_clause("p.content", prompt_contains)
+        turn_clauses.append(clause)
+        turn_params.extend(clause_params)
+
+    next_user_index_sql = (
+        "COALESCE((SELECT MIN(mu.msg_index) "
+        "FROM messages mu "
+        "WHERE mu.conv_id = p.conv_id "
+        "AND mu.role = 'user' "
+        "AND mu.msg_index > p.msg_index), 2147483647)"
+    )
+
+    if role_set == {"assistant"}:
+        turn_clauses.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM messages a
+                WHERE a.conv_id = p.conv_id
+                  AND a.role != 'user'
+                  AND a.msg_index > p.msg_index
+                  AND a.msg_index < {next_user_index_sql}
+            )
+            """
+        )
+
+    if response_contains:
+        turn_clauses.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM messages a
+                WHERE a.conv_id = p.conv_id
+                  AND a.role != 'user'
+                  AND a.msg_index > p.msg_index
+                  AND a.msg_index < {next_user_index_sql}
+                  AND LOWER(COALESCE(a.content, '')) LIKE ?
+            )
+            """
+        )
+        turn_params.append(f"%{response_contains.lower()}%")
+
+    rows = cursor.execute(
+        f"""
+        SELECT
+            p.conv_id AS conv_id,
+            COUNT(*) AS item_count
+        FROM conversations c
+        JOIN messages p
+          ON c.id = p.conv_id
+         AND p.role = 'user'
+        WHERE {" AND ".join(turn_clauses) if turn_clauses else "1=1"}
+        GROUP BY p.conv_id
+        """,
+        turn_params,
+    ).fetchall()
+    conn.close()
+
+    return {
+        "title": _build_virtual_thread_title(filters),
+        "itemCount": sum(int(row["item_count"] or 0) for row in rows),
+        "filters": filters,
+        "conversationIds": [row["conv_id"] for row in rows if row["conv_id"]],
+    }
 
 
 def build_virtual_thread(filters, db_file=DB_FILE):

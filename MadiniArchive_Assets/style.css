@@ -5,6 +5,8 @@
     --bubble-font-size: 1rem;
     --tree-font-size: 0.84em;
     --prompt-font-size: 0.78em;
+    --focus-ring-color: color-mix(in srgb, var(--accent-color) 72%, white 28%);
+    --focus-ring-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-color) 18%, transparent);
 }
 
 body.small-text {
@@ -13,7 +15,34 @@ body.small-text {
     --prompt-font-size: 0.72em;
 }
 
-body { display: flex; height: 100vh; margin: 0; overflow: hidden; background: var(--bg-color); color: var(--text-color); transition: background 0.4s ease, color 0.4s ease; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+body { display: flex; height: 100vh; margin: 0; overflow: hidden; background: var(--bg-color); color: var(--text-color); transition: background 0.4s ease, color 0.4s ease; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; accent-color: var(--accent-color); caret-color: var(--accent-color); }
+::selection {
+    background: color-mix(in srgb, var(--accent-color) 24%, transparent);
+    color: inherit;
+}
+button,
+input,
+textarea,
+select,
+summary {
+    -webkit-tap-highlight-color: transparent;
+}
+button:focus,
+input:not([type="hidden"]):focus,
+textarea:focus,
+select:focus,
+summary:focus {
+    outline: none;
+}
+button:focus-visible,
+input:not([type="hidden"]):focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+summary:focus-visible {
+    outline: 2px solid var(--focus-ring-color);
+    outline-offset: 2px;
+    box-shadow: var(--focus-ring-shadow);
+}
 body.sidebar-hidden #sidebar { display: none; }
 body.sidebar-hidden #resizer { width: 16px; background: transparent; box-shadow: none; }
 body.sidebar-hidden #chat-viewer { padding-left: 18px; }
@@ -184,6 +213,9 @@ body.command-nav-active .conversation-root-prompt.is-sidebar-hidden {
 .search-container { display: flex; gap: 6px; margin-bottom: 10px; }
 .search-container input { flex: 1; padding: 7px 11px; min-height: 30px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--border-color) 76%, transparent); background: color-mix(in srgb, var(--bg-color) 90%, var(--sidebar-bg)); color: var(--text-color); box-sizing: border-box; font-size: 0.84rem; }
 .search-container button { margin: 0; padding: 0 12px; min-height: 30px; border-radius: 9px; font-size: 0.76em; box-shadow: none; }
+.search-container input:focus-visible {
+    border-color: color-mix(in srgb, var(--accent-color) 38%, var(--border-color));
+}
 
 .search-options { font-size: 0.76em; color: var(--sidebar-text); padding-bottom: 10px; border-bottom: 1px solid var(--border-color); margin-bottom: 8px; }
 .search-targets { display: flex; gap: 8px; margin-bottom: 8px; justify-content: flex-start; flex-wrap: wrap; }
@@ -391,6 +423,18 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
     font: inherit;
     font-size: 0.8rem;
     resize: vertical;
+}
+.extract-field input:focus-visible,
+.extract-field select:focus-visible,
+.extract-field textarea:focus-visible,
+.extract-picker-trigger:focus-visible,
+.extract-service-btn:focus-visible,
+.extract-toggle-btn:focus-visible,
+.extract-model-option:focus-visible,
+.extract-cycle-btn:focus-visible,
+.extract-history-btn:focus-visible,
+.extract-chip:focus-visible {
+    border-color: color-mix(in srgb, var(--accent-color) 40%, var(--border-color));
 }
 .extract-summary { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-radius: 12px; background: color-mix(in srgb, var(--bg-color) 66%, var(--sidebar-bg)); border: 1px solid color-mix(in srgb, var(--border-color) 46%, transparent); }
 .extract-summary-top { margin-bottom: 10px; }
@@ -630,7 +674,7 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
     background: transparent;
 }
 .raw-debug-panel-btn:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--accent-color) 64%, white 36%);
+    outline: 2px solid var(--focus-ring-color);
     outline-offset: 2px;
 }
 .raw-debug-panel-btn-icon {
@@ -677,8 +721,9 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
 .tree-node summary:hover { background: color-mix(in srgb, var(--accent-color) 9%, var(--sidebar-bg)); }
 .tree-node summary:focus-visible,
 .prompt-item:focus-visible {
-    outline: 2px solid var(--accent-color);
+    outline: 2px solid var(--focus-ring-color);
     outline-offset: 2px;
+    box-shadow: var(--focus-ring-shadow);
 }
 .tree-summary.focused,
 .prompt-item.focused {
@@ -752,7 +797,12 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
 #sidebar.filter-active .prompt-item-row.no-match,
 #sidebar.filter-active .prompt-item.no-match { display: none !important; }
 
-#chat-viewer { flex: 1; min-width: 0; max-width: 100%; overflow-y: auto; overflow-x: hidden; padding: 0 22px; background: var(--bg-color); scroll-behavior: smooth; color: var(--text-color); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif; letter-spacing: -0.002em; position: relative; box-sizing: border-box; }
+#chat-viewer { flex: 1; min-width: 0; max-width: 100%; overflow-y: auto; overflow-x: hidden; padding: 0 22px; background: var(--bg-color); scroll-behavior: smooth; color: var(--text-color); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif; letter-spacing: -0.002em; position: relative; box-sizing: border-box; outline: none; }
+#chat-viewer:focus,
+#chat-viewer:focus-visible {
+    outline: none !important;
+    box-shadow: none !important;
+}
 .tab-strip {
     position: sticky;
     top: 0;
@@ -928,7 +978,7 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
     color: color-mix(in srgb, var(--text-color) 86%, var(--sidebar-text));
 }
 .tab-button:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--accent-color) 72%, white 28%);
+    outline: 2px solid var(--focus-ring-color);
     outline-offset: 2px;
 }
 .tab-button.dragging {
@@ -1112,7 +1162,7 @@ body.tab-dragging .tab-strip-tabs {
 .conversation-root-shell { position: relative; display: inline-flex; align-items: center; justify-content: center; }
 .conversation-root-avatar-shell { position: relative; z-index: 2; margin-top: 1px; margin-left: auto; }
 .conversation-root-trigger { appearance: none; -webkit-appearance: none; padding: 0; cursor: pointer; background-repeat: no-repeat; }
-.conversation-root-trigger:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent-color) 72%, white 28%); outline-offset: 3px; }
+.conversation-root-trigger:focus-visible { outline: 2px solid var(--focus-ring-color); outline-offset: 3px; box-shadow: var(--focus-ring-shadow); }
 .conversation-root-prompt {
     --prompt-fade: 1;
     --prompt-text-opacity: 1;
@@ -1200,8 +1250,9 @@ body.command-nav-active .conversation-root-prompt.is-sidebar-hidden .conversatio
     will-change: transform, box-shadow;
 }
 .conversation-root-prompt:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--accent-color) 72%, white 28%);
+    outline: 2px solid var(--focus-ring-color);
     outline-offset: 2px;
+    box-shadow: var(--focus-ring-shadow);
 }
 .filter-toggle { display: flex; align-items: center; gap: 6px; font-size: 0.76em; cursor: pointer; color: var(--sidebar-text); font-weight: 600; font-family: -apple-system, sans-serif; margin-right: 0; white-space: nowrap; }
 .filter-toggle input { display: none; }
@@ -1537,8 +1588,9 @@ mark { background-color: var(--accent-color); color: #fff; padding: 0 4px; borde
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 42%, transparent);
 }
 .prompt-nav-item:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--accent-color) 72%, white 28%);
+    outline: 2px solid var(--focus-ring-color);
     outline-offset: 1px;
+    box-shadow: var(--focus-ring-shadow);
 }
 .prompt-nav-item-index {
     flex-shrink: 0;
@@ -1566,6 +1618,42 @@ mark { background-color: var(--accent-color); color: #fff; padding: 0 4px; borde
 .user .bubble a { color: inherit; }
 .bubble code { background: color-mix(in srgb, var(--bg-color) 84%, var(--border-color)); padding: 0.12em 0.32em; border-radius: 5px; max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
 .bubble pre { max-width: 100%; overflow-x: hidden; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; background: color-mix(in srgb, var(--bg-color) 88%, var(--border-color)); padding: 10px 12px; border-radius: 10px; box-sizing: border-box; }
+.markdown-table-wrap {
+    max-width: 100%;
+    margin: 0.7em 0 0.9em;
+    overflow-x: auto;
+    border: 1px solid color-mix(in srgb, var(--border-color) 76%, transparent);
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--bg-color) 94%, var(--bubble-assist-bg));
+}
+.markdown-table {
+    width: 100%;
+    min-width: 32rem;
+    border-collapse: collapse;
+    font-size: 0.96em;
+    line-height: 1.5;
+}
+.markdown-table th,
+.markdown-table td {
+    padding: 0.58em 0.72em;
+    vertical-align: top;
+    border-bottom: 1px solid color-mix(in srgb, var(--border-color) 62%, transparent);
+}
+.markdown-table th {
+    font-weight: 700;
+    color: color-mix(in srgb, var(--text-color) 94%, transparent);
+    background: color-mix(in srgb, var(--bg-color) 88%, var(--border-color));
+}
+.markdown-table tbody tr:last-child td {
+    border-bottom: none;
+}
+.markdown-table td + td,
+.markdown-table th + th {
+    border-left: 1px solid color-mix(in srgb, var(--border-color) 40%, transparent);
+}
+.markdown-table .math-inline {
+    white-space: nowrap !important;
+}
 .bubble pre > code {
     display: block;
     max-width: 100%;

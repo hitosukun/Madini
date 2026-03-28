@@ -70,6 +70,7 @@ let isViewerToolsOpen = false;
 let isExtractModelMenuOpen = false;
 let appliedExtractConversationIds = null;
 let extractPreviewRequestId = 0;
+let treeStructureRevision = 0;
 const CLOSED_TAB_HISTORY_LIMIT = 20;
 
 const ROOT_DOCK_FADE_DISTANCE = 220;
@@ -83,6 +84,314 @@ const TAB_REORDER_ARM_DISTANCE = 24;
 const TAB_DRAG_TOP_MARGIN = 10;
 const TAB_DRAG_BOTTOM_MARGIN = 10;
 const ACTIVE_MATH_RENDERER = "builtin";
+const MATH_ISLAND_CSS = `
+.math-shell,
+.math-shell * {
+    box-sizing: border-box;
+}
+
+.math-shell {
+    color: inherit;
+    font-family: "STIX Two Math", "Latin Modern Math", "Cambria Math", "STIX Two Text", "Times New Roman", serif;
+    font-style: normal;
+    font-weight: 400;
+    letter-spacing: normal;
+    text-transform: none;
+    text-indent: 0;
+    word-spacing: normal;
+    word-break: normal;
+    overflow-wrap: normal;
+    hyphens: none;
+}
+
+.math-shell.math-inline {
+    display: inline-flex;
+    align-items: baseline;
+    white-space: nowrap;
+}
+
+.math-shell.math-display {
+    display: inline-block;
+    min-width: max-content;
+}
+
+.math-content {
+    line-height: 1.4;
+    font-size: 1.06em;
+    font-family: inherit;
+    font-style: inherit;
+    font-weight: inherit;
+    letter-spacing: inherit;
+    text-transform: none;
+}
+
+.math-shell.math-inline .math-content {
+    display: inline-flex;
+    align-items: baseline;
+}
+
+.math-shell.math-display .math-content {
+    display: inline-block;
+    min-width: max-content;
+}
+
+.math-frac {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: stretch;
+    vertical-align: middle;
+    margin: 0 0.12em;
+    text-align: center;
+    line-height: 1.05;
+}
+
+.math-frac-num {
+    display: block;
+    padding: 0 0.2em 0.08em;
+    border-bottom: 1px solid currentColor;
+}
+
+.math-frac-den {
+    display: block;
+    padding: 0.08em 0.2em 0;
+}
+
+.math-sqrt {
+    display: inline-flex;
+    align-items: flex-start;
+    vertical-align: middle;
+}
+
+.math-sqrt-sign {
+    font-size: 1.12em;
+    line-height: 1;
+    padding-right: 0.04em;
+}
+
+.math-sqrt-body {
+    display: inline-block;
+    border-top: 1px solid currentColor;
+    padding: 0.08em 0.12em 0;
+}
+
+.math-matrix {
+    display: inline-flex;
+    align-items: stretch;
+    vertical-align: middle;
+    margin: 0 0.12em;
+}
+
+.math-matrix-bracket {
+    display: inline-flex;
+    align-items: center;
+    font-size: 1.6em;
+    line-height: 1;
+    padding: 0 0.06em;
+}
+
+.math-matrix-grid {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 0.08em;
+    padding: 0.04em 0.08em;
+}
+
+.math-matrix-row {
+    display: inline-flex;
+    justify-content: center;
+    align-items: baseline;
+    gap: 0.65em;
+    min-height: 1.1em;
+}
+
+.math-matrix-cell {
+    display: inline-block;
+    min-width: 0.8em;
+    text-align: center;
+}
+
+.math-matrix.math-matrix-cases .math-matrix-grid {
+    padding-left: 0.14em;
+    padding-right: 0;
+}
+
+.math-matrix.math-matrix-cases .math-matrix-row {
+    justify-content: flex-start;
+    gap: 0.9em;
+}
+
+.math-matrix.math-matrix-cases .math-matrix-cell {
+    min-width: 0;
+    text-align: left;
+}
+
+.math-matrix.math-matrix-vmatrix .math-matrix-bracket,
+.math-matrix.math-matrix-Vmatrix .math-matrix-bracket {
+    font-size: 1.36em;
+    font-weight: 500;
+    padding: 0 0.12em;
+}
+
+.math-accent {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+    padding-top: 0.2em;
+}
+
+.math-accent-mark {
+    position: absolute;
+    left: 50%;
+    top: -0.18em;
+    transform: translateX(-50%);
+    font-size: 0.82em;
+    line-height: 1;
+    pointer-events: none;
+}
+
+.math-accent-bar .math-accent-mark {
+    top: -0.12em;
+}
+
+.math-accent-body {
+    display: inline-block;
+}
+
+.math-text {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif;
+    font-size: 0.95em;
+    font-style: normal;
+    font-weight: 500;
+    letter-spacing: normal;
+    text-transform: none;
+}
+
+.math-text-roman,
+.math-operator {
+    font-style: normal;
+}
+
+.math-text-bold {
+    font-weight: 700;
+}
+
+.math-text-italic {
+    font-style: italic;
+}
+
+.math-text-blackboard {
+    font-family: "Times New Roman", "STIX Two Math", "Cambria Math", serif;
+    font-weight: 650;
+    letter-spacing: 0.01em;
+}
+
+.math-text-calligraphic {
+    font-family: "Apple Chancery", "Snell Roundhand", "Times New Roman", cursive;
+    font-weight: 600;
+}
+
+.math-unknown {
+    opacity: 0.88;
+}
+
+.math-shell sup,
+.math-shell sub {
+    font-size: 0.72em;
+    line-height: 0;
+    position: relative;
+}
+
+.math-shell sup {
+    top: -0.45em;
+}
+
+.math-shell sub {
+    bottom: -0.1em;
+}
+
+.math-fallback .math-content {
+    font-size: 0.96em;
+}
+
+.math-shell.math-display.math-fallback {
+    display: block;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.math-fallback-block {
+    display: block;
+    width: min(100%, 58rem);
+    margin: 0.12em 0;
+    border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+    border-radius: 14px;
+    background: color-mix(in srgb, currentColor 5%, transparent);
+    box-shadow: inset 0 1px 0 color-mix(in srgb, white 14%, transparent);
+    overflow: hidden;
+}
+
+.math-fallback-inline {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    padding: 0.06em 0.46em;
+    border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, currentColor 5%, transparent);
+    vertical-align: baseline;
+}
+
+.math-fallback-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8em;
+    padding: 0.42em 0.72em;
+    border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent);
+    background: color-mix(in srgb, currentColor 4%, transparent);
+}
+
+.math-fallback-label {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.6em;
+    padding: 0 0.5em;
+    border-radius: 999px;
+    background: color-mix(in srgb, currentColor 9%, transparent);
+    color: inherit;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    opacity: 0.86;
+}
+
+.math-fallback-note {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif;
+    font-size: 0.76rem;
+    line-height: 1.35;
+    opacity: 0.68;
+}
+
+.math-fallback-pre {
+    margin: 0;
+    padding: 0.72em 0.86em 0.84em;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: pre;
+    line-height: 1.55;
+}
+
+.math-tex-raw {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    white-space: inherit;
+    word-break: normal;
+    overflow-wrap: normal;
+    color: inherit;
+}
+`;
 // Phase 2 keyboard model:
 // - APP_NATIVE: PyQt/macOS owns the chord, JS owns the resulting state change.
 // - VIEWER_NAVIGATION: document-level reading actions when no local widget owns the key.
@@ -121,6 +430,36 @@ const STORAGE_KEYS = {
     tabSession: "novel-archive-tab-session",
 };
 
+const COMMON_MATH_OPERATOR_NAMES = Object.freeze([
+    "arg",
+    "cos",
+    "cosh",
+    "cot",
+    "coth",
+    "csc",
+    "deg",
+    "det",
+    "dim",
+    "exp",
+    "gcd",
+    "hom",
+    "inf",
+    "ker",
+    "lim",
+    "ln",
+    "log",
+    "max",
+    "min",
+    "mod",
+    "Pr",
+    "sec",
+    "sin",
+    "sinh",
+    "sup",
+    "tan",
+    "tanh",
+]);
+
 const EXTRACT_TEXT_FILTER_SPECS = [
     { key: "dateFrom", elementId: "extract-date-from", summaryLabel: "from" },
     { key: "dateTo", elementId: "extract-date-to", summaryLabel: "to" },
@@ -129,6 +468,25 @@ const EXTRACT_TEXT_FILTER_SPECS = [
     { key: "responseContains", elementId: "extract-response", summaryLabel: "response" },
     { key: "sourceFile", elementId: "extract-source-file", summaryLabel: "file" },
 ];
+
+function debugPerfLog(label) {
+    const perf = window.performance;
+    const now = perf && typeof perf.now === "function" ? perf.now() : Date.now();
+    console.log(`[perf] ${Math.round(now)}ms ${label}`);
+}
+
+function markTreeStructureDirty() {
+    treeStructureRevision += 1;
+}
+
+function getTreeStructureSignature() {
+    return [
+        treeStructureRevision,
+        isAllTreesExpanded ? "all" : `single:${currentTreeConvIdx ?? ""}`,
+        isSidebarFilterActive ? "sidebar-filter-on" : "sidebar-filter-off",
+        currentParsedQuery.fuseQuery || "",
+    ].join("|");
+}
 
 function escapeHTML(str) {
     if (!str) return "";
@@ -165,13 +523,73 @@ function createHtmlPlaceholderStore(prefix = "HTML_PLACEHOLDER") {
     };
 }
 
-function renderMathFragment(source) {
+function normalizeMathSourceArtifacts(sourceText) {
+    let nextText = String(sourceText || "");
+
+    // Recover common legacy math HTML snippets into TeX-like source before the
+    // markdown and math passes run. This keeps old imported logs renderable.
+    nextText = nextText.replace(
+        /<span\b[^>]*class=(["'])math-frac\1[^>]*>\s*<span\b[^>]*class=(["'])math-frac-num\2[^>]*>([\s\S]*?)<\/span>\s*<span\b[^>]*class=(["'])math-frac-den\4[^>]*>([\s\S]*?)<\/span>\s*<\/span>/gi,
+        (_match, _q1, _q2, numerator, _q3, denominator) => `\\frac{${numerator}}{${denominator}}`
+    );
+    nextText = nextText.replace(
+        /<span\b[^>]*class=(["'])math-sqrt\1[^>]*>\s*<span\b[^>]*class=(["'])math-sqrt-sign\2[^>]*>√<\/span>\s*<span\b[^>]*class=(["'])math-sqrt-body\3[^>]*>([\s\S]*?)<\/span>\s*<\/span>/gi,
+        (_match, _q1, _q2, _q3, body) => `\\sqrt{${body}}`
+    );
+    const entityReplacements = [
+        ["&middot;", "\\cdot "],
+        ["&times;", "\\times "],
+        ["&divide;", "\\div "],
+        ["&plusmn;", "\\pm "],
+        ["&thinsp;", "\\,"],
+        ["&nbsp;", " "],
+    ];
+
+    const lines = nextText.split("\n").map((line) => {
+        const looksMathArtifactLine =
+            /class=(["'])math-[^"']+\1/i.test(line)
+            || /&(middot|times|divide|plusmn|thinsp|nbsp);/i.test(line)
+            || (
+                /<(sup|sub)\b/i.test(line)
+                && (
+                    /\\[A-Za-z]+/.test(line)
+                    || /(?:^|[^A-Za-z])(sinh|cosh|tanh|sin|cos|tan|log|ln|lim|exp|max|min|cosh|sinh)(?:[^A-Za-z]|$)/i.test(line)
+                    || /[=+/*√^]/.test(line)
+                    || /\be<sup\b/i.test(line)
+                )
+            );
+
+        if (!looksMathArtifactLine) {
+            return line;
+        }
+
+        let normalizedLine = line;
+        normalizedLine = normalizedLine.replace(/<sup\b[^>]*>([\s\S]*?)<\/sup>/gi, (_match, inner) => `^{${inner}}`);
+        normalizedLine = normalizedLine.replace(/<sub\b[^>]*>([\s\S]*?)<\/sub>/gi, (_match, inner) => `_{${inner}}`);
+        normalizedLine = normalizedLine.replace(/<\/?span\b[^>]*class=(["'])math-[^"']+\1[^>]*>/gi, "");
+        normalizedLine = normalizedLine.replace(/<br\s*\/?>/gi, "\\\\");
+        entityReplacements.forEach(([pattern, replacement]) => {
+            normalizedLine = normalizedLine.split(pattern).join(replacement);
+        });
+        return normalizedLine;
+    });
+
+    return lines.join("\n");
+}
+
+function renderMathFragment(source, htmlPlaceholders = null) {
+    const placeholderStore = htmlPlaceholders || createHtmlPlaceholderStore("MATH_HTML");
+    const shouldRestore = !htmlPlaceholders;
     let html = escapeHTML(String(source || "").trim());
     const replacements = [
-        ["\\cdot", "&middot;"],
-        ["\\times", "&times;"],
-        ["\\div", "&divide;"],
-        ["\\pm", "&plusmn;"],
+        ["\\displaystyle", ""],
+        ["\\textstyle", ""],
+        ["\\scriptstyle", ""],
+        ["\\scriptscriptstyle", ""],
+        ["\\cdot", "·"],
+        ["\\times", "×"],
+        ["\\div", "÷"],
+        ["\\pm", "±"],
         ["\\mp", "∓"],
         ["\\approx", "≈"],
         ["\\neq", "≠"],
@@ -207,13 +625,20 @@ function renderMathFragment(source) {
         ["\\beta", "β"],
         ["\\gamma", "γ"],
         ["\\delta", "δ"],
+        ["\\varepsilon", "ε"],
         ["\\epsilon", "ϵ"],
         ["\\theta", "θ"],
+        ["\\vartheta", "ϑ"],
         ["\\lambda", "λ"],
         ["\\mu", "μ"],
         ["\\pi", "π"],
+        ["\\varpi", "ϖ"],
+        ["\\rho", "ρ"],
+        ["\\varrho", "ϱ"],
         ["\\sigma", "σ"],
+        ["\\varsigma", "ς"],
         ["\\phi", "φ"],
+        ["\\varphi", "ϕ"],
         ["\\omega", "ω"],
         ["\\Delta", "Δ"],
         ["\\Theta", "Θ"],
@@ -224,8 +649,14 @@ function renderMathFragment(source) {
         ["\\Omega", "Ω"],
         ["\\left", ""],
         ["\\right", ""],
-        ["\\,", "&thinsp;"],
-        ["\\;", "&nbsp;"],
+        ["\\quad", " "],
+        ["\\qquad", "  "],
+        ["\\ldots", "…"],
+        ["\\cdots", "⋯"],
+        ["\\dots", "…"],
+        ["\\,", " "],
+        ["\\:", " "],
+        ["\\;", " "],
         ["\\!", ""],
     ];
 
@@ -236,46 +667,189 @@ function renderMathFragment(source) {
     let previous = "";
     while (html !== previous) {
         previous = html;
-        html = html.replace(/\\text\{([^{}]+)\}/g, (_match, inner) => `<span class="math-text">${inner}</span>`);
+        html = html.replace(
+            /\\begin\{(bmatrix|pmatrix|matrix|cases|vmatrix|Vmatrix)\}([\s\S]*?)\\end\{\1\}/g,
+            (_match, kind, body) => placeholderStore.put(renderMathMatrix(kind, body, placeholderStore))
+        );
+        html = html.replace(/\\vec\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAccent("vec", inner, placeholderStore)));
+        html = html.replace(/\\hat\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAccent("hat", inner, placeholderStore)));
+        html = html.replace(/\\tilde\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAccent("tilde", inner, placeholderStore)));
+        html = html.replace(/\\bar\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAccent("bar", inner, placeholderStore)));
+        html = html.replace(
+            new RegExp(String.raw`\\(${COMMON_MATH_OPERATOR_NAMES.join("|")})\b`, "g"),
+            (_match, operatorName) => placeholderStore.put(renderMathOperator(operatorName))
+        );
+        html = html.replace(/\\operatorname\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-text math-operator">${renderMathFragment(inner, placeholderStore)}</span>`));
+        html = html.replace(/\\mathrm\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-text math-text-roman">${renderMathFragment(inner, placeholderStore)}</span>`));
+        html = html.replace(/\\mathbf\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-text math-text-bold">${renderMathFragment(inner, placeholderStore)}</span>`));
+        html = html.replace(/\\mathit\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-text math-text-italic">${renderMathFragment(inner, placeholderStore)}</span>`));
+        html = html.replace(/\\mathbb\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAlphabet("mathbb", inner, placeholderStore)));
+        html = html.replace(/\\mathcal\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAlphabet("mathcal", inner, placeholderStore)));
+        html = html.replace(/\\text\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-text">${inner}</span>`));
         html = html.replace(/\\sqrt\{([^{}]+)\}/g, (_match, inner) => (
-            `<span class="math-sqrt"><span class="math-sqrt-sign">√</span><span class="math-sqrt-body">${renderMathFragment(inner)}</span></span>`
+            placeholderStore.put(`<span class="math-sqrt"><span class="math-sqrt-sign">√</span><span class="math-sqrt-body">${renderMathFragment(inner, placeholderStore)}</span></span>`)
         ));
         html = html.replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g, (_match, numerator, denominator) => (
-            `<span class="math-frac"><span class="math-frac-num">${renderMathFragment(numerator)}</span><span class="math-frac-den">${renderMathFragment(denominator)}</span></span>`
+            placeholderStore.put(`<span class="math-frac"><span class="math-frac-num">${renderMathFragment(numerator, placeholderStore)}</span><span class="math-frac-den">${renderMathFragment(denominator, placeholderStore)}</span></span>`)
         ));
-        html = html.replace(/\^\{([^{}]+)\}/g, (_match, inner) => `<sup>${renderMathFragment(inner)}</sup>`);
-        html = html.replace(/_\{([^{}]+)\}/g, (_match, inner) => `<sub>${renderMathFragment(inner)}</sub>`);
+        html = html.replace(/\^\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<sup>${renderMathFragment(inner, placeholderStore)}</sup>`));
+        html = html.replace(/_\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<sub>${renderMathFragment(inner, placeholderStore)}</sub>`));
     }
 
     html = html.replace(/\^([A-Za-z0-9+\-*/=().]+)/g, "<sup>$1</sup>");
     html = html.replace(/_([A-Za-z0-9+\-*/=().]+)/g, "<sub>$1</sub>");
+    html = normalizeResidualMathCommands(html);
     html = html.replace(/[{}]/g, "");
+    if (shouldRestore) {
+        html = placeholderStore.restore(html);
+    }
     return html;
 }
 
-function canRenderMathFragment(source, renderedHtml) {
+function evaluateMathRender(source, renderedHtml) {
     const rawSource = String(source || "").trim();
-    if (!rawSource) return true;
-    if (!renderedHtml || !String(renderedHtml).trim()) return false;
-    if (/\\[A-Za-z]+/.test(renderedHtml)) return false;
-    return !/[{}]/.test(renderedHtml);
+    if (!rawSource) {
+        return { ok: true, reason: "empty-source" };
+    }
+    if (!renderedHtml || !String(renderedHtml).trim()) {
+        return { ok: false, reason: "empty-render" };
+    }
+    if (/\\(?:begin|end)\{/.test(renderedHtml)) {
+        return { ok: false, reason: "unresolved-environment" };
+    }
+    if (/\\[A-Za-z]+/.test(renderedHtml)) {
+        return { ok: false, reason: "unresolved-command" };
+    }
+    if (/[{}]/.test(renderedHtml)) {
+        return { ok: false, reason: "structural-residue" };
+    }
+    return { ok: true, reason: "rendered" };
+}
+
+function normalizeResidualMathCommands(html) {
+    let nextHtml = String(html || "");
+    nextHtml = nextHtml.replace(/\\\\/g, "<br>");
+    nextHtml = nextHtml.replace(/\\(?=\s)/g, "");
+    nextHtml = nextHtml.replace(/\\([A-Za-z]+)\b/g, (_match, name) => {
+        if (name === "begin" || name === "end") {
+            return `\\${name}`;
+        }
+        return `<span class="math-text math-unknown">${escapeHTML(name)}</span>`;
+    });
+    return nextHtml;
+}
+
+function renderMathAccent(kind, inner, htmlPlaceholders = null) {
+    const accentMarks = {
+        vec: "→",
+        hat: "^",
+        tilde: "~",
+        bar: "¯",
+    };
+    const accentMark = accentMarks[kind] || "¯";
+    return `<span class="math-accent math-accent-${kind}"><span class="math-accent-mark">${accentMark}</span><span class="math-accent-body">${renderMathFragment(inner, htmlPlaceholders)}</span></span>`;
+}
+
+function renderMathOperator(name) {
+    return `<span class="math-text math-operator">${escapeHTML(String(name || "").trim())}</span>`;
+}
+
+function renderMathAlphabet(kind, inner, htmlPlaceholders = null) {
+    const normalized = String(inner || "").trim();
+    if (!normalized) return "";
+
+    if (kind === "mathbb") {
+        const blackboardMap = {
+            C: "ℂ",
+            H: "ℍ",
+            N: "ℕ",
+            P: "ℙ",
+            Q: "ℚ",
+            R: "ℝ",
+            Z: "ℤ",
+        };
+        if (/^[A-Z]$/.test(normalized) && blackboardMap[normalized]) {
+            return `<span class="math-text math-text-blackboard">${blackboardMap[normalized]}</span>`;
+        }
+        return `<span class="math-text math-text-blackboard">${renderMathFragment(normalized, htmlPlaceholders)}</span>`;
+    }
+
+    if (kind === "mathcal") {
+        return `<span class="math-text math-text-calligraphic">${renderMathFragment(normalized, htmlPlaceholders)}</span>`;
+    }
+
+    return renderMathFragment(normalized, htmlPlaceholders);
+}
+
+function renderMathMatrix(kind, body, htmlPlaceholders = null) {
+    const bracketByKind = {
+        bmatrix: ["[", "]"],
+        pmatrix: ["(", ")"],
+        matrix: ["", ""],
+        cases: ["{", ""],
+        vmatrix: ["|", "|"],
+        Vmatrix: ["‖", "‖"],
+    };
+    const [leftBracket, rightBracket] = bracketByKind[kind] || ["[", "]"];
+    const normalizedBody = String(body || "").trim();
+    const rows = normalizedBody
+        .split(/\\\\/g)
+        .map((row) => row.trim())
+        .filter(Boolean);
+    const rowHtml = rows
+        .map((row) => {
+            const cells = row
+                .split("&")
+                .map((cell) => cell.trim())
+                .filter((cell) => cell.length > 0);
+            const cellHtml = (cells.length ? cells : [""])
+                .map((cell) => `<span class="math-matrix-cell">${renderMathFragment(cell, htmlPlaceholders)}</span>`)
+                .join("");
+            return `<span class="math-matrix-row">${cellHtml}</span>`;
+        })
+        .join("");
+    const leftHtml = leftBracket ? `<span class="math-matrix-bracket math-matrix-bracket-left">${leftBracket}</span>` : "";
+    const rightHtml = rightBracket ? `<span class="math-matrix-bracket math-matrix-bracket-right">${rightBracket}</span>` : "";
+    return `<span class="math-matrix math-matrix-${kind}">${leftHtml}<span class="math-matrix-grid">${rowHtml}</span>${rightHtml}</span>`;
 }
 
 function renderMathFallback(source, displayMode = false) {
+    const rawSource = escapeHTML(String(source || "").trim());
+    if (displayMode) {
+        return `
+            <div class="math-display math-fallback math-fallback-block" data-math-fallback="true">
+                <div class="math-fallback-header">
+                    <span class="math-fallback-label">Math</span>
+                    <span class="math-fallback-note">fallback view</span>
+                </div>
+                <pre class="math-fallback-pre"><code class="math-tex-raw">${rawSource}</code></pre>
+            </div>
+        `.trim();
+    }
+    return `<span class="math-inline math-fallback math-fallback-inline" data-math-fallback="true"><code class="math-tex-raw">${rawSource}</code></span>`;
+}
+
+function buildMathHtmlNode({ source, displayMode = false, renderedHtml = "", evaluation = null }) {
     const tag = displayMode ? "div" : "span";
     const className = displayMode ? "math-display" : "math-inline";
-    return `<${tag} class="${className} math-fallback" data-math-fallback="true"><span class="math-content"><span class="math-tex-raw">${escapeHTML(String(source || "").trim())}</span></span></${tag}>`;
+    const renderEvaluation = evaluation || evaluateMathRender(source, renderedHtml);
+    if (!renderEvaluation.ok) {
+        return renderMathFallback(source, displayMode);
+    }
+    return `<${tag} class="${className}" data-math-rendered="true" data-math-reason="${renderEvaluation.reason}"><span class="math-content">${renderedHtml}</span></${tag}>`;
 }
 
 function renderMathBlock(source, displayMode = false) {
-    const tag = displayMode ? "div" : "span";
-    const className = displayMode ? "math-display" : "math-inline";
     try {
-        const rendered = renderMathFragment(source);
-        if (!canRenderMathFragment(source, rendered)) {
-            return renderMathFallback(source, displayMode);
+        let rendered = renderMathFragment(source);
+        if (displayMode && String(source || "").includes("\n")) {
+            rendered = rendered.replace(/\n+/g, "<br>");
         }
-        return `<${tag} class="${className}" data-math-rendered="true"><span class="math-content">${rendered}</span></${tag}>`;
+        return buildMathHtmlNode({
+            source,
+            displayMode,
+            renderedHtml: rendered,
+        });
     } catch (_error) {
         return renderMathFallback(source, displayMode);
     }
@@ -283,6 +857,190 @@ function renderMathBlock(source, displayMode = false) {
 
 function ensureRenderer() {
     return ACTIVE_MATH_RENDERER;
+}
+
+function isolateRenderedMath(root) {
+    if (!root?.querySelectorAll) return;
+
+    root.querySelectorAll(".math-inline, .math-display").forEach((node) => {
+        if (node.dataset.mathIsolated === "true") return;
+        if (typeof node.attachShadow !== "function") return;
+        if (node.shadowRoot) {
+            node.dataset.mathIsolated = "true";
+            return;
+        }
+
+        const innerHtml = node.innerHTML;
+        if (!String(innerHtml || "").trim()) return;
+
+        const shellTag = node.classList.contains("math-display") ? "div" : "span";
+        const shellClasses = ["math-shell"];
+        if (node.classList.contains("math-display")) {
+            shellClasses.push("math-display");
+        } else {
+            shellClasses.push("math-inline");
+        }
+        if (node.classList.contains("math-fallback")) {
+            shellClasses.push("math-fallback");
+        }
+
+        const shadowRoot = node.attachShadow({ mode: "open" });
+        shadowRoot.innerHTML = `
+            <style>${MATH_ISLAND_CSS}</style>
+            <${shellTag} class="${shellClasses.join(" ")}">${innerHtml}</${shellTag}>
+        `;
+        node.dataset.mathIsolated = "true";
+        node.innerHTML = "";
+    });
+}
+
+function replaceInlineDollarMath(sourceText, placeholders) {
+    let result = "";
+    let cursor = 0;
+
+    while (cursor < sourceText.length) {
+        const start = sourceText.indexOf("$", cursor);
+        if (start === -1) {
+            result += sourceText.slice(cursor);
+            break;
+        }
+
+        if (sourceText[start - 1] === "\\") {
+            result += sourceText.slice(cursor, start - 1) + "$";
+            cursor = start + 1;
+            continue;
+        }
+
+        if (sourceText[start + 1] === "$") {
+            result += sourceText.slice(cursor, start + 2);
+            cursor = start + 2;
+            continue;
+        }
+
+        result += sourceText.slice(cursor, start);
+
+        let end = start + 1;
+        let found = false;
+        while (end < sourceText.length) {
+            if (sourceText[end] === "\n") {
+                break;
+            }
+            if (
+                sourceText[end] === "$"
+                && sourceText[end - 1] !== "\\"
+                && sourceText[end + 1] !== "$"
+            ) {
+                found = true;
+                break;
+            }
+            end += 1;
+        }
+
+        if (!found) {
+            result += "$";
+            cursor = start + 1;
+            continue;
+        }
+
+        const expr = sourceText.slice(start + 1, end).trim();
+        if (!expr) {
+            result += sourceText.slice(start, end + 1);
+            cursor = end + 1;
+            continue;
+        }
+
+        result += placeholders.put(renderMathBlock(expr, false));
+        cursor = end + 1;
+    }
+
+    return result;
+}
+
+function looksLikeStandaloneMathBlockStart(line) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) return false;
+    return (
+        looksLikeStandaloneMathLine(trimmed)
+        || /\\begin\{(?:bmatrix|pmatrix|matrix)\}/.test(trimmed)
+    );
+}
+
+function looksLikeStandaloneMathBlockContinuation(line) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) return false;
+    if (/^[-*]\s/.test(trimmed) || /^\d+\.\s/.test(trimmed)) return false;
+    if (/[。、「」『』【】]/.test(trimmed)) return false;
+    if (looksLikeStandaloneMathLine(trimmed)) return true;
+    if (/[&=+\-*/^_<>]/.test(trimmed)) return true;
+    if (/^[A-Za-z0-9]+(?:\s+[A-Za-z0-9]+)*$/.test(trimmed) && trimmed.length <= 16) {
+        return true;
+    }
+    return false;
+}
+
+function replaceStandaloneMathBlocks(sourceText, placeholders) {
+    const lines = String(sourceText || "").split("\n");
+    const output = [];
+    let blockLines = [];
+
+    const flushBlock = () => {
+        if (!blockLines.length) return;
+        output.push(placeholders.put(renderMathBlock(blockLines.join("\n"), true)));
+        blockLines = [];
+    };
+
+    lines.forEach((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) {
+            flushBlock();
+            output.push(line);
+            return;
+        }
+
+        if (!blockLines.length) {
+            if (looksLikeStandaloneMathBlockStart(trimmed)) {
+                blockLines.push(trimmed);
+            } else {
+                output.push(line);
+            }
+            return;
+        }
+
+        if (looksLikeStandaloneMathBlockContinuation(trimmed)) {
+            blockLines.push(trimmed);
+            return;
+        }
+
+        flushBlock();
+        output.push(line);
+    });
+
+    flushBlock();
+    return output.join("\n");
+}
+
+function looksLikeStandaloneMathLine(line) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) return false;
+    if (!trimmed.includes("\\")) return false;
+    if (/^[-*]\s/.test(trimmed) || /^\d+\.\s/.test(trimmed)) return false;
+    if (/[。、「」『』【】]/.test(trimmed)) return false;
+    if (!/\\[A-Za-z]+/.test(trimmed)) return false;
+
+    const reduced = trimmed
+        .replace(/\\[A-Za-z]+\*?(?:\{[^{}]*\})?/g, "")
+        .replace(/[{}[\]()^_=+\-*/,:;.|<>~`'"\d\s]/g, "")
+        .replace(/[A-Za-z]/g, "");
+    return reduced.length === 0;
+}
+
+function replaceStandaloneMathLines(sourceText, placeholders) {
+    return sourceText.replace(/(^|\n)([^\n]+)/g, (match, prefix, line) => {
+        if (!looksLikeStandaloneMathLine(line)) {
+            return match;
+        }
+        return `${prefix}${placeholders.put(renderMathBlock(line.trim(), true))}`;
+    });
 }
 
 function initBridge() {
@@ -338,6 +1096,7 @@ function mergeConversationDetail(convIdx, detail) {
         _idx: convIdx,
         promptPreviews: hydrated.promptPreviews.length > 0 ? hydrated.promptPreviews : current.promptPreviews,
     };
+    markTreeStructureDirty();
 }
 
 function loadConversationDetail(convIdx) {
@@ -1599,18 +2358,16 @@ function revealActiveTabStripButton(options = {}) {
 
     const stripRect = strip.getBoundingClientRect();
     const targetRect = target.getBoundingClientRect();
-    const visibilityPadding = Number.isFinite(options.padding) ? options.padding : 18;
-    const isFullyVisible =
-        targetRect.left >= stripRect.left + visibilityPadding &&
-        targetRect.right <= stripRect.right - visibilityPadding;
+    const clipTolerance = Number.isFinite(options.tolerance) ? options.tolerance : 1;
+    const isClippedLeft = targetRect.left < stripRect.left - clipTolerance;
+    const isClippedRight = targetRect.right > stripRect.right + clipTolerance;
 
-    if (!isFullyVisible) {
-        const revealDirection =
-            targetRect.left < stripRect.left + visibilityPadding ? "left" : "right";
+    if (isClippedLeft || isClippedRight) {
+        const revealDirection = isClippedLeft ? "left" : "right";
         target.scrollIntoView({
             behavior: options.behavior || "smooth",
             block: "nearest",
-            inline: options.inline || "center",
+            inline: options.inline || "nearest",
         });
         if (options.motion !== false) {
             playTabStripRevealMotion(target, revealDirection);
@@ -3725,7 +4482,95 @@ function renderMathSegments(sourceText, placeholders) {
     nextText = nextText.replace(/\\\(([\s\S]*?)\\\)/g, (_match, expr) => {
         return placeholders.put(renderMathBlock(expr, false));
     });
-    return nextText;
+    nextText = replaceInlineDollarMath(nextText, placeholders);
+    nextText = replaceStandaloneMathBlocks(nextText, placeholders);
+    return replaceStandaloneMathLines(nextText, placeholders);
+}
+
+function isMarkdownTableSeparator(line) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed.includes("|")) return false;
+    return /^\|?(?:\s*:?-{3,}:?\s*\|)+(?:\s*:?-{3,}:?\s*)\|?$/.test(trimmed);
+}
+
+function parseMarkdownTableRow(line) {
+    const normalized = String(line || "").trim().replace(/^\|/, "").replace(/\|$/, "");
+    return normalized.split("|").map((cell) => cell.trim());
+}
+
+function buildMarkdownTableHtml(lines) {
+    if (!Array.isArray(lines) || lines.length < 2) return null;
+    const headerCells = parseMarkdownTableRow(lines[0]);
+    const alignCells = parseMarkdownTableRow(lines[1]);
+    if (!headerCells.length || headerCells.length !== alignCells.length) return null;
+
+    const alignments = alignCells.map((cell) => {
+        const trimmed = cell.trim();
+        const alignLeft = trimmed.startsWith(":");
+        const alignRight = trimmed.endsWith(":");
+        if (alignLeft && alignRight) return "center";
+        if (alignRight) return "right";
+        return "left";
+    });
+
+    const bodyRows = lines.slice(2)
+        .map((line) => parseMarkdownTableRow(line))
+        .filter((cells) => cells.some((cell) => cell.length > 0));
+
+    if (!bodyRows.length) return null;
+
+    const headerHtml = headerCells
+        .map((cell, index) => `<th style="text-align:${alignments[index]};">${cell || "&nbsp;"}</th>`)
+        .join("");
+    const bodyHtml = bodyRows
+        .map((cells) => {
+            const normalizedCells = headerCells.map((_, index) => cells[index] || "");
+            const cellHtml = normalizedCells
+                .map((cell, index) => `<td style="text-align:${alignments[index]};">${cell || "&nbsp;"}</td>`)
+                .join("");
+            return `<tr>${cellHtml}</tr>`;
+        })
+        .join("");
+
+    return `<div class="markdown-table-wrap"><table class="markdown-table"><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table></div>`;
+}
+
+function replaceMarkdownTables(html) {
+    const lines = String(html || "").split("\n");
+    const output = [];
+
+    for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
+        const nextLine = lines[index + 1];
+        const looksLikeHeader = String(line || "").includes("|");
+        const looksLikeSeparator = isMarkdownTableSeparator(nextLine);
+
+        if (!looksLikeHeader || !looksLikeSeparator) {
+            output.push(line);
+            continue;
+        }
+
+        const tableLines = [line, nextLine];
+        let cursor = index + 2;
+        while (cursor < lines.length) {
+            const candidate = lines[cursor];
+            if (!String(candidate || "").trim()) break;
+            if (!String(candidate || "").includes("|")) break;
+            tableLines.push(candidate);
+            cursor += 1;
+        }
+
+        const tableHtml = buildMarkdownTableHtml(tableLines);
+        if (tableHtml) {
+            output.push(tableHtml);
+            index = cursor - 1;
+            continue;
+        }
+
+        output.push(line);
+    }
+
+    return output.join("\n");
 }
 
 function applyBasicMarkdown(html) {
@@ -3739,6 +4584,7 @@ function applyBasicMarkdown(html) {
     nextHtml = nextHtml.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
     nextHtml = nextHtml.replace(/\*(.+?)\*/g, "<em>$1</em>");
     nextHtml = nextHtml.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+    nextHtml = replaceMarkdownTables(nextHtml);
     nextHtml = nextHtml.replace(/\n/g, "<br>");
     return nextHtml;
 }
@@ -3750,6 +4596,7 @@ function renderContent(text) {
 
     // Keep code segments opaque so later markdown/math passes cannot corrupt them.
     sourceText = protectCodeSegments(sourceText, codePlaceholders);
+    sourceText = normalizeMathSourceArtifacts(sourceText);
     sourceText = renderMathSegments(sourceText, mathPlaceholders);
 
     let html = escapeHTML(sourceText);
@@ -4961,6 +5808,28 @@ function requestVirtualThread(filters) {
     });
 }
 
+function requestVirtualThreadPreview(filters) {
+    return waitForBridge().then((bridge) => {
+        if (!bridge || !bridge.buildVirtualThreadPreview) {
+            return requestVirtualThread(filters).then((virtualThread) => ({
+                itemCount: virtualThread?.itemCount || 0,
+                conversationIds: Array.from(
+                    new Set((virtualThread?.items || []).map((item) => item.convId).filter(Boolean))
+                ),
+            }));
+        }
+        return new Promise((resolve, reject) => {
+            bridge.buildVirtualThreadPreview(JSON.stringify(filters), function (result) {
+                try {
+                    resolve(result ? JSON.parse(result) : null);
+                } catch (error) {
+                    reject(error);
+                }
+            });
+        });
+    });
+}
+
 function hasActiveExtractFilters(filters) {
     if (!filters) return false;
     return Boolean(
@@ -4975,40 +5844,47 @@ function hasActiveVirtualFilters(filters) {
     return hasActiveExtractFilters(filters);
 }
 
-function syncExtractFiltersToDirectory(virtualThread, filters) {
+function syncExtractFiltersToDirectory(previewResult, filters) {
     if (!isSidebarFilterActive || !hasActiveExtractFilters(filters)) {
         appliedExtractConversationIds = null;
     } else {
         const convIds = Array.from(
-            new Set((virtualThread?.items || []).map((item) => item.convId).filter(Boolean))
+            new Set((previewResult?.conversationIds || []).filter(Boolean))
         );
         appliedExtractConversationIds = new Set(convIds);
     }
+    markTreeStructureDirty();
     renderTree();
 }
 
-function updateExtractPreviewCount(virtualThread) {
+function updateExtractPreviewCount(previewResult) {
     const countNode = document.getElementById("extract-hit-count");
     if (countNode) {
-        countNode.textContent = String(virtualThread?.itemCount || 0);
+        countNode.textContent = String(previewResult?.itemCount || 0);
     }
 }
 
-async function requestExtractResult(filters, options = {}) {
-    const virtualThread = await requestVirtualThread(filters);
-    if (options.requestId !== undefined && options.requestId !== extractPreviewRequestId) {
+async function requestExtractPreviewResult(filters, options = {}) {
+    const previewStartedAt = window.performance?.now?.() ?? Date.now();
+    const previewResult = await requestVirtualThreadPreview(filters);
+    if (options.requestId !== extractPreviewRequestId) {
         return null;
     }
     if (options.updateCount) {
-        updateExtractPreviewCount(virtualThread);
+        updateExtractPreviewCount(previewResult);
     }
     if (options.syncDirectory) {
-        syncExtractFiltersToDirectory(virtualThread, filters);
+        syncExtractFiltersToDirectory(previewResult, filters);
     }
-    return virtualThread;
+    const previewElapsed = (window.performance?.now?.() ?? Date.now()) - previewStartedAt;
+    if (previewElapsed >= 120) {
+        console.log(`[perf] extractPreview ${Math.round(previewElapsed)}ms`);
+    }
+    return previewResult;
 }
 
 async function refreshDirectoryFromExtractFilters(forceImmediate = false) {
+    void forceImmediate;
     const filters = getExtractFilterState();
     const requestId = ++extractPreviewRequestId;
 
@@ -5017,12 +5893,12 @@ async function refreshDirectoryFromExtractFilters(forceImmediate = false) {
         return;
     }
 
-    const virtualThread = await requestExtractResult(filters, {
-        requestId: forceImmediate ? undefined : requestId,
+    const previewResult = await requestExtractPreviewResult(filters, {
+        requestId,
         syncDirectory: true,
         updateCount: false,
     });
-    if (!forceImmediate && !virtualThread) {
+    if (!previewResult) {
         return;
     }
 }
@@ -5035,7 +5911,7 @@ function scheduleVirtualThreadPreview() {
     }
     extractPreviewTimer = window.setTimeout(async () => {
         const requestId = ++extractPreviewRequestId;
-        await requestExtractResult(filters, {
+        await requestExtractPreviewResult(filters, {
             requestId,
             syncDirectory: true,
             updateCount: true,
@@ -5060,6 +5936,7 @@ function clearVirtualThreadFilters() {
     writeExtractMultiValue("extract-service", []);
     writeExtractMultiValue("extract-model", []);
     appliedExtractConversationIds = null;
+    markTreeStructureDirty();
     syncExtractServiceButtons();
     renderExtractModelMenu();
     syncExtractModelTrigger();
@@ -5148,11 +6025,17 @@ function sortConversations(targetData, sortMode) {
 }
 
 function renderTree() {
+    const renderStartedAt = window.performance?.now?.() ?? Date.now();
     const treeRoot = document.getElementById("index-tree");
+    if (!treeRoot) return;
     const shouldRestoreFocusedTreeItem =
-        treeRoot &&
         treeRoot.contains(document.activeElement) &&
         document.activeElement !== treeRoot;
+    const nextStructureSignature = getTreeStructureSignature();
+    if (treeRoot.dataset.structureSignature === nextStructureSignature) {
+        syncSidebarActiveStateToCurrentView({ scroll: false });
+        return;
+    }
     const sortSelect = document.getElementById("sort-select");
     const directoryFilterState = getDirectoryFilterState();
     const isSearch = directoryFilterState.hasKeywordSearch;
@@ -5255,10 +6138,17 @@ function renderTree() {
     } else {
         treeRoot.innerHTML = htmlStr;
     }
+    treeRoot.dataset.structureSignature = nextStructureSignature;
     if (shouldRestoreFocusedTreeItem) {
         restoreSidebarFocus();
     }
     syncSidebarActiveStateToCurrentView({ scroll: false });
+    const renderElapsed = (window.performance?.now?.() ?? Date.now()) - renderStartedAt;
+    if (renderElapsed >= 120) {
+        console.log(
+            `[perf] renderTree ${Math.round(renderElapsed)}ms convs=${targetData.length} search=${isSearch} sidebarFilter=${isSidebarFilterActive}`
+        );
+    }
 }
 
 function jumpToMessage(convIdx, msgIdx, scrollBehavior = "smooth") {
@@ -5559,6 +6449,7 @@ async function renderChat(convIdx, options = {}) {
             revealActiveTabStripButton();
         }
     }
+    isolateRenderedMath(viewer);
     enhanceCodeBlocks(viewer);
     playPendingTabReorderAnimation();
     document.querySelectorAll(".chat-row.user").forEach((el) => scrollObserver.observe(el));
@@ -5686,6 +6577,7 @@ function renderVirtualThreadTab(tab) {
     syncTabStripRovingFocus();
     restorePendingTabStripFocus();
     revealActiveTabStripButton();
+    isolateRenderedMath(viewer);
     enhanceCodeBlocks(viewer);
     playPendingTabReorderAnimation();
     applyTheme();
@@ -5955,6 +6847,7 @@ async function executeSearch() {
     if (!searchBar) {
         currentParsedQuery = { fuseQuery: "", words: [] };
         currentSearchResults = {};
+        markTreeStructureDirty();
         renderTree();
         return;
     }
@@ -5965,6 +6858,7 @@ async function executeSearch() {
     };
     persistSearchPreferences();
     currentSearchResults = await requestSearchResults(searchSpec);
+    markTreeStructureDirty();
     renderTree();
 
     const currentConv = document.getElementById("chat-viewer").dataset.currentConv;
@@ -5975,9 +6869,13 @@ async function executeSearch() {
 
 async function bootViewer(options = {}) {
     try {
+        debugPerfLog("boot:start");
         ensureRenderer();
+        debugPerfLog("boot:renderer-ready");
         initBridge();
+        debugPerfLog("boot:bridge-init");
         chatData = Array.isArray(window.__CHAT_INDEX__) ? window.__CHAT_INDEX__.map(hydrateConversation) : [];
+        debugPerfLog(`boot:index-loaded convs=${chatData.length}`);
         currentThemes = JSON.parse(document.getElementById("theme-data").textContent);
 
         activeTheme = localStorage.getItem(STORAGE_KEYS.theme) || "default";
@@ -6057,20 +6955,31 @@ async function bootViewer(options = {}) {
         ensureNativeShortcutFallbacks();
         ensureTabSessionLifecyclePersistence();
         ensureReadingContextWidgetFocusBridges();
+        debugPerfLog("boot:before-filter-options");
         populateExtractOptions(await requestFilterOptions());
+        debugPerfLog("boot:after-filter-options");
         await refreshSavedViews();
+        debugPerfLog("boot:after-saved-views");
         await refreshBookmarkList();
+        debugPerfLog("boot:after-bookmarks");
         await refreshRecentFilters();
+        debugPerfLog("boot:after-recent-filters");
         switchSidebarMode(sidebarMode);
+        debugPerfLog(`boot:after-sidebar-mode mode=${sidebarMode}`);
         scheduleVirtualThreadPreview();
+        debugPerfLog("boot:after-schedule-preview");
         applySidebarVisibility();
         applyTheme();
         refreshUtilityToggleButtons();
+        debugPerfLog("boot:before-execute-search");
         await executeSearch();
+        debugPerfLog("boot:after-execute-search");
         await restoreOpenTabsFromSession();
+        debugPerfLog("boot:after-restore-tabs");
         window.requestAnimationFrame(() => {
             ensureInitialAppFocus();
         });
+        debugPerfLog("boot:ready");
 
         if (options.showToast) {
             showToast("✨ 登録完了！");

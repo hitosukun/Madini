@@ -13,6 +13,7 @@ env/
 # Build artifacts
 build/
 dist/
+.pyinstaller/
 
 # Runtime and generated app data
 *.db

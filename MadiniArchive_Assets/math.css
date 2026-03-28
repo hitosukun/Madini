@@ -1,0 +1,306 @@
+.math-inline,
+.math-display,
+.math-inline *,
+.math-display * {
+    box-sizing: border-box;
+}
+
+.conversation-root-prompt .math-display {
+    margin: 0.3em 0;
+}
+
+.math-inline,
+.math-display {
+    font-family: "STIX Two Math", "Latin Modern Math", "Cambria Math", "STIX Two Text", "Times New Roman", serif;
+    color: inherit;
+    font-style: normal !important;
+    font-weight: 400 !important;
+    letter-spacing: normal !important;
+    text-transform: none !important;
+    text-indent: 0 !important;
+    word-spacing: normal !important;
+    word-break: normal !important;
+    overflow-wrap: normal !important;
+    hyphens: none !important;
+}
+
+.math-inline {
+    display: inline-flex;
+    align-items: baseline;
+    max-width: 100%;
+    vertical-align: -0.08em;
+    white-space: nowrap !important;
+    overflow: visible;
+}
+
+.math-display {
+    display: block;
+    margin: 0.55em 0;
+    max-width: 100%;
+    padding: 0.26em 0.08em 0.3em;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: nowrap !important;
+}
+
+.math-display::-webkit-scrollbar {
+    height: 6px;
+}
+
+.math-content {
+    line-height: 1.4;
+    font-size: 1.06em;
+    font-family: inherit !important;
+    font-style: inherit !important;
+    font-weight: inherit !important;
+    letter-spacing: inherit !important;
+    text-transform: none !important;
+}
+
+.math-inline .math-content {
+    display: inline-flex;
+    align-items: baseline;
+}
+
+.math-display .math-content {
+    display: inline-flex;
+    align-items: baseline;
+    min-width: max-content;
+    padding-bottom: 0.04em;
+}
+
+.math-frac {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: stretch;
+    vertical-align: middle;
+    margin: 0 0.12em;
+    text-align: center;
+    line-height: 1.05;
+}
+
+.math-frac-num {
+    display: block;
+    padding: 0 0.2em 0.08em;
+    border-bottom: 1px solid currentColor;
+}
+
+.math-frac-den {
+    display: block;
+    padding: 0.08em 0.2em 0;
+}
+
+.math-sqrt {
+    display: inline-flex;
+    align-items: flex-start;
+    vertical-align: middle;
+}
+
+.math-sqrt-sign {
+    font-size: 1.12em;
+    line-height: 1;
+    padding-right: 0.04em;
+}
+
+.math-sqrt-body {
+    display: inline-block;
+    border-top: 1px solid currentColor;
+    padding: 0.08em 0.12em 0;
+}
+
+.math-matrix {
+    display: inline-flex;
+    align-items: stretch;
+    vertical-align: middle;
+    margin: 0 0.12em;
+}
+
+.math-matrix-bracket {
+    display: inline-flex;
+    align-items: center;
+    font-size: 1.6em;
+    line-height: 1;
+    padding: 0 0.06em;
+}
+
+.math-matrix-grid {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 0.08em;
+    padding: 0.04em 0.08em;
+}
+
+.math-matrix-row {
+    display: inline-flex;
+    justify-content: center;
+    align-items: baseline;
+    gap: 0.65em;
+    min-height: 1.1em;
+}
+
+.math-matrix-cell {
+    display: inline-block;
+    min-width: 0.8em;
+    text-align: center;
+}
+
+.math-matrix.math-matrix-cases .math-matrix-grid {
+    padding-left: 0.14em;
+    padding-right: 0;
+}
+
+.math-matrix.math-matrix-cases .math-matrix-row {
+    justify-content: flex-start;
+    gap: 0.9em;
+}
+
+.math-matrix.math-matrix-cases .math-matrix-cell {
+    min-width: 0;
+    text-align: left;
+}
+
+.math-matrix.math-matrix-vmatrix .math-matrix-bracket,
+.math-matrix.math-matrix-Vmatrix .math-matrix-bracket {
+    font-size: 1.36em;
+    font-weight: 500;
+    padding: 0 0.12em;
+}
+
+.math-text {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif;
+    font-size: 0.95em;
+    font-style: normal !important;
+    font-weight: 500 !important;
+    letter-spacing: normal !important;
+    text-transform: none !important;
+}
+
+.math-text-roman,
+.math-operator {
+    font-style: normal !important;
+}
+
+.math-text-bold {
+    font-weight: 700 !important;
+}
+
+.math-text-italic {
+    font-style: italic !important;
+}
+
+.math-inline sup,
+.math-inline sub,
+.math-display sup,
+.math-display sub {
+    font-size: 0.72em;
+    line-height: 0;
+    position: relative;
+}
+
+.math-inline sup,
+.math-display sup {
+    top: -0.45em;
+}
+
+.math-inline sub,
+.math-display sub {
+    bottom: -0.1em;
+}
+
+.math-fallback .math-content {
+    font-size: 0.96em;
+}
+
+.math-display.math-fallback {
+    min-width: 0;
+}
+
+.math-fallback-block {
+    display: block;
+    width: min(100%, 58rem);
+    margin: 0.12em 0;
+    border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+    border-radius: 14px;
+    background: color-mix(in srgb, currentColor 5%, transparent);
+    box-shadow: inset 0 1px 0 color-mix(in srgb, white 14%, transparent);
+    overflow: hidden;
+}
+
+.math-fallback-inline {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    padding: 0.06em 0.46em;
+    border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, currentColor 5%, transparent);
+    vertical-align: baseline;
+}
+
+.math-fallback-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8em;
+    padding: 0.42em 0.72em;
+    border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent);
+    background: color-mix(in srgb, currentColor 4%, transparent);
+}
+
+.math-fallback-label {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.6em;
+    padding: 0 0.5em;
+    border-radius: 999px;
+    background: color-mix(in srgb, currentColor 9%, transparent);
+    color: inherit;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    opacity: 0.86;
+}
+
+.math-fallback-note {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif;
+    font-size: 0.76rem;
+    line-height: 1.35;
+    opacity: 0.68;
+}
+
+.math-fallback-pre {
+    margin: 0;
+    padding: 0.72em 0.86em 0.84em;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: pre;
+    line-height: 1.55;
+}
+
+.bubble .math-display,
+.conversation-root-prompt-body .math-display,
+.virtual-fragment-body .math-display {
+    max-width: 100%;
+}
+
+.bubble .math-display:first-child,
+.conversation-root-prompt-body .math-display:first-child,
+.virtual-fragment-body .math-display:first-child {
+    margin-top: 0.15em;
+}
+
+.bubble .math-display:last-child,
+.conversation-root-prompt-body .math-display:last-child,
+.virtual-fragment-body .math-display:last-child {
+    margin-bottom: 0.15em;
+}
+
+.math-tex-raw {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    white-space: inherit;
+    word-break: normal;
+    overflow-wrap: normal;
+    color: color-mix(in srgb, var(--text-color) 92%, var(--accent-color) 8%);
+}

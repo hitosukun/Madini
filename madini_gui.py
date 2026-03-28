@@ -41,9 +41,11 @@ except ImportError:
     sys.exit(1)
 
 import split_chatlog
+from app_metadata import APP_NAME, APP_WEB_PROFILE_NAME
 from app_paths import TEMP_HTML, USER_DATA_DIR, VIEWER_INDEX_JS
 from archive_store import (
     build_virtual_thread,
+    build_virtual_thread_preview,
     delete_saved_view,
     ensure_user_data_dir,
     fetch_bookmark_states,
@@ -220,6 +222,14 @@ class ViewerBridge(QObject):
             params = {}
         return json.dumps(build_virtual_thread(params), ensure_ascii=False)
 
+    @pyqtSlot(str, result=str)
+    def buildVirtualThreadPreview(self, payload):
+        try:
+            params = json.loads(payload)
+        except json.JSONDecodeError:
+            params = {}
+        return json.dumps(build_virtual_thread_preview(params), ensure_ascii=False)
+
     @pyqtSlot(str)
     def log(self, message):
         self.log_callback(f"🌐 [Viewer]: {message}")
@@ -244,9 +254,9 @@ class MadiniApp(QMainWindow):
         self._command_active = False
         self.console_lines = []
         self.console_expanded = False
-        self.status_bar_visible = True
+        self.status_bar_visible = False
 
-        self.setWindowTitle("Madini - Local Archive Browser")
+        self.setWindowTitle(APP_NAME)
         self.resize(1200, 800)
         self.setAcceptDrops(True)
 
@@ -257,7 +267,7 @@ class MadiniApp(QMainWindow):
 
         self.viewer = QWebEngineView()
         self.viewer.setAcceptDrops(False)
-        self.web_profile = QWebEngineProfile("MadiniProfile", self.viewer)
+        self.web_profile = QWebEngineProfile(APP_WEB_PROFILE_NAME, self.viewer)
         profile_root = USER_DATA_DIR / "web_profile"
         profile_root.mkdir(parents=True, exist_ok=True)
         self.web_profile.setPersistentStoragePath(str(profile_root / "storage"))
@@ -390,6 +400,7 @@ class MadiniApp(QMainWindow):
             }
             """
         )
+        status_bar.setVisible(self.status_bar_visible)
 
     def set_console_expanded(self, expanded):
         if not self.status_bar_visible:
@@ -429,7 +440,7 @@ class MadiniApp(QMainWindow):
         menu_bar = self.menuBar()
         view_menu = menu_bar.addMenu("表示")
         self.status_bar_action = QAction("ステータスバーを表示", self, checkable=True)
-        self.status_bar_action.setChecked(True)
+        self.status_bar_action.setChecked(self.status_bar_visible)
         self.status_bar_action.triggered.connect(self.set_status_bar_visible)
         view_menu.addAction(self.status_bar_action)
         menu_bar.addAction(

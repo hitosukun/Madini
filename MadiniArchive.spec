@@ -1,11 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from app_metadata import (
+    APP_ASSET_DIR_NAME,
+    APP_BUNDLE_IDENTIFIER,
+    APP_ICON_PATH,
+    APP_NAME,
+    APP_VERSION,
+)
 
 a = Analysis(
     ['madini_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('NovelStudio_Assets', 'NovelStudio_Assets')],
+    datas=[(APP_ASSET_DIR_NAME, APP_ASSET_DIR_NAME)],
     hiddenimports=['PyQt6.QtWebChannel'],
     hookspath=[],
     hooksconfig={},
@@ -21,7 +28,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Madini - Local Archive Browser',
+    name=APP_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -32,7 +39,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['Madini.icns'],
+    icon=[APP_ICON_PATH],
 )
 coll = COLLECT(
     exe,
@@ -41,11 +48,18 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='Madini - Local Archive Browser',
+    name=APP_NAME,
 )
 app = BUNDLE(
     coll,
-    name='Madini - Local Archive Browser.app',
-    icon='Madini.icns',
-    bundle_identifier=None,
+    name=f'{APP_NAME}.app',
+    icon=APP_ICON_PATH,
+    bundle_identifier=APP_BUNDLE_IDENTIFIER,
+    info_plist={
+        'CFBundleDisplayName': APP_NAME,
+        'CFBundleName': APP_NAME,
+        'CFBundleShortVersionString': APP_VERSION,
+        'CFBundleVersion': APP_VERSION,
+        'LSApplicationCategoryType': 'public.app-category.productivity',
+    },
 )
