@@ -47,11 +47,15 @@ from archive_store import (
     build_virtual_thread,
     build_virtual_thread_preview,
     delete_saved_view,
+    delete_starred_filter,
     ensure_user_data_dir,
     fetch_bookmark_states,
     fetch_filter_options,
     list_bookmarks,
+    list_starred_filters,
+    list_starred_prompts,
     fetch_conversation_raw_source,
+    fetch_conversation_raw_text,
     list_saved_filters,
     list_saved_views,
     fetch_conversation_detail,
@@ -60,6 +64,7 @@ from archive_store import (
     load_themes,
     save_recent_filter,
     save_saved_view,
+    save_starred_filter,
     search_conversations_for_spec,
     set_bookmark,
 )
@@ -126,6 +131,11 @@ class ViewerBridge(QObject):
         detail = fetch_conversation_raw_source(conv_id)
         return json.dumps(detail, ensure_ascii=False) if detail else ""
 
+    @pyqtSlot(str, result=str)
+    def fetchConversationRawText(self, conv_id):
+        detail = fetch_conversation_raw_text(conv_id)
+        return json.dumps(detail, ensure_ascii=False) if detail else ""
+
     @pyqtSlot(result=str)
     def fetchFilterOptions(self):
         return json.dumps(fetch_filter_options(), ensure_ascii=False)
@@ -137,6 +147,14 @@ class ViewerBridge(QObject):
     @pyqtSlot(result=str)
     def fetchSavedViews(self):
         return json.dumps(list_saved_views(), ensure_ascii=False)
+
+    @pyqtSlot(result=str)
+    def fetchStarredFilters(self):
+        return json.dumps(list_starred_filters(), ensure_ascii=False)
+
+    @pyqtSlot(result=str)
+    def fetchStarredPrompts(self):
+        return json.dumps(list_starred_prompts(), ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
     def saveRecentFilter(self, payload):
@@ -162,12 +180,38 @@ class ViewerBridge(QObject):
         return json.dumps(saved or {}, ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
+    def saveStarredFilter(self, payload):
+        try:
+            params = json.loads(payload)
+        except json.JSONDecodeError:
+            params = {}
+        saved = save_starred_filter(
+            params.get("name"),
+            params.get("filters"),
+            target_type=params.get("targetType") or "virtual_thread",
+            starred_filter_id=params.get("id"),
+        )
+        return json.dumps(saved or {}, ensure_ascii=False)
+
+    @pyqtSlot(str, result=str)
     def deleteSavedView(self, payload):
         try:
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
         deleted = delete_saved_view(
+            params.get("id"),
+            target_type=params.get("targetType") or "virtual_thread",
+        )
+        return json.dumps(deleted, ensure_ascii=False)
+
+    @pyqtSlot(str, result=str)
+    def deleteStarredFilter(self, payload):
+        try:
+            params = json.loads(payload)
+        except json.JSONDecodeError:
+            params = {}
+        deleted = delete_starred_filter(
             params.get("id"),
             target_type=params.get("targetType") or "virtual_thread",
         )

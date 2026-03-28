@@ -451,7 +451,7 @@ def fetch_all_conversations(db_file=DB_FILE):
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     model_expr, source_file_expr, _columns = _conversation_select_fragment(cursor, "conversations")
-    bookmarked_thread_ids = _fetch_bookmarked_thread_ids(cursor)
+    starred_prompt_counts = _fetch_starred_prompt_counts(cursor)
 
     conv_rows = cursor.execute(
         f"""
@@ -485,7 +485,8 @@ def fetch_all_conversations(db_file=DB_FILE):
                 "date": row["date_str"],
                 "model": row["model"],
                 "sourceFile": row["source_file"],
-                "bookmarked": row["id"] in bookmarked_thread_ids,
+                "bookmarked": starred_prompt_counts.get(row["id"], 0) > 0,
+                "starredPromptCount": starred_prompt_counts.get(row["id"], 0),
                 "messages": messages,
                 "promptCount": row["prompt_count"],
                 "prompts_text": _joined_message_text(messages, "user"),
@@ -523,7 +524,7 @@ def fetch_conversation_index(
         if "imported_at" in _columns
         else "NULL AS imported_at"
     )
-    bookmarked_thread_ids = _fetch_bookmarked_thread_ids(cursor)
+    starred_prompt_counts = _fetch_starred_prompt_counts(cursor)
 
     conv_rows = cursor.execute(
         f"""
@@ -545,7 +546,8 @@ def fetch_conversation_index(
             "sourceFile": row["source_file"],
             "source_created_at": row["source_created_at"],
             "imported_at": row["imported_at"],
-            "bookmarked": row["id"] in bookmarked_thread_ids,
+            "bookmarked": starred_prompt_counts.get(row["id"], 0) > 0,
+            "starredPromptCount": starred_prompt_counts.get(row["id"], 0),
             "promptCount": row["prompt_count"],
             "promptPreviews": [],
             "prompts_text": "",
@@ -623,7 +625,7 @@ def fetch_conversation_detail(conv_id, db_file=DB_FILE):
     if "raw_source_id" in _columns and _table_exists(cursor, "raw_sources"):
         source_format_expr = "raw_sources.source_format AS source_format"
         join_clause = "LEFT JOIN raw_sources ON raw_sources.id = conversations.raw_source_id"
-    bookmarked_thread_ids = _fetch_bookmarked_thread_ids(cursor)
+    starred_prompt_counts = _fetch_starred_prompt_counts(cursor)
 
     row = cursor.execute(
         f"""
@@ -670,7 +672,8 @@ def fetch_conversation_detail(conv_id, db_file=DB_FILE):
         "source_created_at": row["source_created_at"],
         "imported_at": row["imported_at"],
         "source_format": row["source_format"],
-        "bookmarked": row["id"] in bookmarked_thread_ids,
+        "bookmarked": starred_prompt_counts.get(row["id"], 0) > 0,
+        "starredPromptCount": starred_prompt_counts.get(row["id"], 0),
         "promptCount": row["prompt_count"],
         "messages": messages,
         "prompts_text": _joined_message_text(messages, "user"),
@@ -678,7 +681,7 @@ def fetch_conversation_detail(conv_id, db_file=DB_FILE):
     }
 
 
-def fetch_conversation_raw_source(conv_id, db_file=DB_FILE):
+def fetch_conversation_raw_source(conv_id, db_file=DB_FILE, preview_chars=12000):
     # Developer-facing raw/provenance entry point. This is intentionally separate
     # from fetch_conversation_detail() so raw text stays out of the normal detail path.
     if not db_file.exists():
@@ -708,8 +711,75 @@ def fetch_conversation_raw_source(conv_id, db_file=DB_FILE):
             r.mime_type,
             r.size_bytes,
             r.text_encoding,
-            r.raw_text,
+            CASE
+                WHEN r.raw_text IS NULL THEN 0
+                ELSE LENGTH(r.raw_text)
+            END AS raw_text_length,
+            SUBSTR(COALESCE(r.raw_text, ''), 1, ?) AS raw_text_preview,
             r.raw_bytes_path
+        FROM conversations c
+        LEFT JOIN raw_sources r ON r.id = c.raw_source_id
+        WHERE c.id = ?
+        """,
+        (max(0, int(preview_chars or 0)), conv_id),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+
+    if row["raw_source_id"] is None:
+        return {
+            "convId": row["conv_id"],
+            "rawSourceId": None,
+            "sourceFile": row["source_file"],
+            "sourceCreatedAt": row["conversation_source_created_at"],
+            "importedAt": row["conversation_imported_at"],
+            "rawTextPreview": "",
+            "rawTextLength": 0,
+            "rawTextTruncated": False,
+            "available": False,
+        }
+
+    raw_text_length = int(row["raw_text_length"] or 0)
+    raw_text_preview = row["raw_text_preview"] or ""
+    return {
+        "convId": row["conv_id"],
+        "rawSourceId": row["raw_source_id"],
+        "sourceHash": row["source_hash"],
+        "sourceFormat": row["source_format"],
+        "sourcePath": row["source_path"],
+        "sourceCreatedAt": row["source_created_at"] or row["conversation_source_created_at"],
+        "importedAt": row["imported_at"] or row["conversation_imported_at"],
+        "mimeType": row["mime_type"],
+        "sizeBytes": row["size_bytes"],
+        "textEncoding": row["text_encoding"],
+        "rawTextPreview": raw_text_preview,
+        "rawTextLength": raw_text_length,
+        "rawTextTruncated": raw_text_length > len(raw_text_preview),
+        "rawBytesPath": row["raw_bytes_path"],
+        "sourceFile": row["source_file"],
+        "available": True,
+    }
+
+
+def fetch_conversation_raw_text(conv_id, db_file=DB_FILE):
+    if not db_file.exists():
+        return None
+
+    conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    columns = _get_conversation_columns(cursor)
+    if "raw_source_id" not in columns:
+        conn.close()
+        return None
+
+    row = cursor.execute(
+        """
+        SELECT
+            c.id AS conv_id,
+            c.raw_source_id,
+            r.raw_text
         FROM conversations c
         LEFT JOIN raw_sources r ON r.id = c.raw_source_id
         WHERE c.id = ?
@@ -723,29 +793,16 @@ def fetch_conversation_raw_source(conv_id, db_file=DB_FILE):
     if row["raw_source_id"] is None:
         return {
             "convId": row["conv_id"],
-            "rawSourceId": None,
-            "sourceFile": row["source_file"],
-            "sourceCreatedAt": row["conversation_source_created_at"],
-            "importedAt": row["conversation_imported_at"],
-            "rawText": "",
             "available": False,
+            "rawText": "",
         }
 
+    raw_text = row["raw_text"] or ""
     return {
         "convId": row["conv_id"],
-        "rawSourceId": row["raw_source_id"],
-        "sourceHash": row["source_hash"],
-        "sourceFormat": row["source_format"],
-        "sourcePath": row["source_path"],
-        "sourceCreatedAt": row["source_created_at"] or row["conversation_source_created_at"],
-        "importedAt": row["imported_at"] or row["conversation_imported_at"],
-        "mimeType": row["mime_type"],
-        "sizeBytes": row["size_bytes"],
-        "textEncoding": row["text_encoding"],
-        "rawText": row["raw_text"] or "",
-        "rawBytesPath": row["raw_bytes_path"],
-        "sourceFile": row["source_file"],
         "available": True,
+        "rawText": raw_text,
+        "rawTextLength": len(raw_text),
     }
 
 
@@ -958,9 +1015,27 @@ def _normalize_filter_values(value):
 
 def _normalize_bookmarked_filter(value):
     normalized = str(value or "").strip().lower()
-    if normalized in {"bookmarked", "only", "true", "1", "yes"}:
+    if normalized in {
+        "bookmarked",
+        "only",
+        "true",
+        "1",
+        "yes",
+        "starred",
+        "starred-prompt",
+        "has-starred-prompt",
+    }:
         return "bookmarked"
-    if normalized in {"not-bookmarked", "not_bookmarked", "exclude", "false", "0", "no"}:
+    if normalized in {
+        "not-bookmarked",
+        "not_bookmarked",
+        "exclude",
+        "false",
+        "0",
+        "no",
+        "not-starred",
+        "without-starred-prompt",
+    }:
         return "not-bookmarked"
     return "all"
 
@@ -1047,9 +1122,9 @@ def _build_filter_history_label(filters):
     if filters.get("sourceFile"):
         parts.append(f"file={filters['sourceFile']}")
     if filters.get("bookmarked") == "bookmarked":
-        parts.append("bookmarked")
+        parts.append("has starred prompt")
     elif filters.get("bookmarked") == "not-bookmarked":
-        parts.append("not bookmarked")
+        parts.append("without starred prompt")
 
     if not parts:
         return "すべての会話"
@@ -1082,6 +1157,46 @@ def _decode_filter_history_row(row):
         "updatedAt": row["last_used_at"],
         "lastUsedAt": row["last_used_at"],
     }
+
+
+def list_starred_filters(
+    target_type="virtual_thread",
+    limit=100,
+    db_file=DB_FILE,
+):
+    return list_saved_views(
+        target_type=target_type,
+        limit=limit,
+        db_file=db_file,
+    )
+
+
+def save_starred_filter(
+    name,
+    filters,
+    target_type="virtual_thread",
+    starred_filter_id=None,
+    db_file=DB_FILE,
+):
+    return save_saved_view(
+        name,
+        filters,
+        target_type=target_type,
+        saved_view_id=starred_filter_id,
+        db_file=db_file,
+    )
+
+
+def delete_starred_filter(
+    starred_filter_id,
+    target_type="virtual_thread",
+    db_file=DB_FILE,
+):
+    return delete_saved_view(
+        starred_filter_id,
+        target_type=target_type,
+        db_file=db_file,
+    )
 
 
 def list_saved_filters(
@@ -1559,6 +1674,19 @@ def _build_bookmark_list_entry(row):
     }
 
 
+def _split_prompt_bookmark_target_id(target_id):
+    conv_id, separator, message_index_text = str(target_id or "").rpartition(":")
+    if not separator or not conv_id:
+        return "", None
+    try:
+        message_index = int(message_index_text)
+    except (TypeError, ValueError):
+        return "", None
+    if message_index < 0:
+        return "", None
+    return conv_id, message_index
+
+
 def list_bookmarks(db_file=DB_FILE):
     ensure_user_data_dir()
     if not db_file.exists():
@@ -1583,6 +1711,94 @@ def list_bookmarks(db_file=DB_FILE):
     return [_build_bookmark_list_entry(row) for row in rows]
 
 
+def list_starred_prompts(limit=500, db_file=DB_FILE):
+    ensure_user_data_dir()
+    if not db_file.exists():
+        return []
+
+    conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    if not _table_exists(cursor, "bookmarks"):
+        conn.close()
+        return []
+
+    rows = cursor.execute(
+        """
+        SELECT target_type, target_id, payload_json, created_at, updated_at
+        FROM bookmarks
+        WHERE target_type = 'prompt'
+        ORDER BY updated_at DESC, created_at DESC, target_id DESC
+        LIMIT ?
+        """,
+        (max(1, int(limit or 500)),),
+    ).fetchall()
+
+    conversation_ids = []
+    parsed_rows = []
+    for row in rows:
+        conv_id, message_index = _split_prompt_bookmark_target_id(row["target_id"])
+        if not conv_id or message_index is None:
+            continue
+        payload = {}
+        raw_payload = row["payload_json"]
+        if raw_payload:
+            try:
+                payload = json.loads(raw_payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+        parsed_rows.append((row, conv_id, message_index, payload))
+        if conv_id not in conversation_ids:
+            conversation_ids.append(conv_id)
+
+    conversation_meta = {}
+    if conversation_ids:
+        placeholders = ", ".join("?" for _ in conversation_ids)
+        for row in cursor.execute(
+            f"""
+            SELECT id, title, source, model, date_str, source_file
+            FROM conversations
+            WHERE id IN ({placeholders})
+            """,
+            conversation_ids,
+        ).fetchall():
+            conversation_meta[row["id"]] = {
+                "threadTitle": row["title"] or "Untitled",
+                "source": row["source"] or "",
+                "model": row["model"] or "",
+                "date": row["date_str"] or "",
+                "sourceFile": row["source_file"] or "",
+            }
+
+    conn.close()
+
+    entries = []
+    for row, conv_id, message_index, payload in parsed_rows:
+        meta = conversation_meta.get(conv_id, {})
+        title = payload.get("title") or f"Prompt {message_index + 1}"
+        entries.append(
+            {
+                "targetType": "prompt",
+                "targetId": row["target_id"],
+                "parentConversationId": conv_id,
+                "messageIndex": message_index,
+                "label": title,
+                "title": title,
+                "threadTitle": meta.get("threadTitle") or payload.get("threadTitle") or "Untitled",
+                "source": meta.get("source", ""),
+                "model": meta.get("model", ""),
+                "date": meta.get("date", ""),
+                "sourceFile": meta.get("sourceFile", ""),
+                "payload": payload,
+                "bookmarked": True,
+                "createdAt": row["created_at"],
+                "updatedAt": row["updated_at"],
+            }
+        )
+    return entries
+
+
 def _fetch_bookmarked_target_ids(cursor, target_type):
     if not _table_exists(cursor, "bookmarks"):
         return set()
@@ -1603,6 +1819,23 @@ def _fetch_bookmarked_thread_ids(cursor):
     # Current read paths still consume thread bookmarks only. Keep this narrow while
     # bookmark target types expand on the target-spec/write boundary first.
     return _fetch_bookmarked_target_ids(cursor, "thread")
+
+
+def _fetch_starred_prompt_counts(cursor):
+    if not _table_exists(cursor, "bookmarks"):
+        return {}
+    counts = defaultdict(int)
+    for row in cursor.execute(
+        """
+        SELECT target_id
+        FROM bookmarks
+        WHERE target_type = 'prompt'
+        """
+    ).fetchall():
+        conv_id, message_index = _split_prompt_bookmark_target_id(row["target_id"])
+        if conv_id and message_index is not None:
+            counts[conv_id] += 1
+    return dict(counts)
 
 
 def _build_virtual_thread_title(filters):
@@ -1636,13 +1869,13 @@ def _build_virtual_thread_title(filters):
     if source_file:
         parts.append(f"file={source_file}")
     if bookmarked == "bookmarked":
-        parts.append("bookmarked")
+        parts.append("has starred prompt")
     elif bookmarked == "not-bookmarked":
-        parts.append("not bookmarked")
+        parts.append("without starred prompt")
 
     if not parts:
-        return "仮想スレッド"
-    return "仮想スレッド: " + ", ".join(parts)
+        return "Filter Preview"
+    return "Filter Preview: " + ", ".join(parts)
 
 
 def _build_virtual_thread_where(filters, has_bookmarks_table=True, primary_time_field="primary_time"):
@@ -1718,8 +1951,8 @@ def _build_virtual_thread_where(filters, has_bookmarks_table=True, primary_time_
                 EXISTS (
                     SELECT 1
                     FROM bookmarks b
-                    WHERE b.target_type = 'thread'
-                      AND b.target_id = conv_id
+                    WHERE b.target_type = 'prompt'
+                      AND substr(b.target_id, 1, length(conv_id) + 1) = conv_id || ':'
                 )
                 """
             )
@@ -1731,8 +1964,8 @@ def _build_virtual_thread_where(filters, has_bookmarks_table=True, primary_time_
             NOT EXISTS (
                 SELECT 1
                 FROM bookmarks b
-                WHERE b.target_type = 'thread'
-                  AND b.target_id = conv_id
+                WHERE b.target_type = 'prompt'
+                  AND substr(b.target_id, 1, length(conv_id) + 1) = conv_id || ':'
             )
             """
         )
@@ -1805,8 +2038,8 @@ def _build_virtual_thread_conversation_where(
                 EXISTS (
                     SELECT 1
                     FROM bookmarks b
-                    WHERE b.target_type = 'thread'
-                      AND b.target_id = {table_alias}.id
+                    WHERE b.target_type = 'prompt'
+                      AND substr(b.target_id, 1, length({table_alias}.id) + 1) = {table_alias}.id || ':'
                 )
                 """
             )
@@ -1818,8 +2051,8 @@ def _build_virtual_thread_conversation_where(
             NOT EXISTS (
                 SELECT 1
                 FROM bookmarks b
-                WHERE b.target_type = 'thread'
-                  AND b.target_id = {table_alias}.id
+                WHERE b.target_type = 'prompt'
+                  AND substr(b.target_id, 1, length({table_alias}.id) + 1) = {table_alias}.id || ':'
             )
             """
         )
@@ -1973,7 +2206,7 @@ def build_virtual_thread(filters, db_file=DB_FILE):
         else "NULL AS imported_at"
     )
     primary_time_expr = _conversation_primary_time_expr(columns, "c")
-    bookmarked_thread_ids = _fetch_bookmarked_thread_ids(cursor)
+    starred_prompt_counts = _fetch_starred_prompt_counts(cursor)
     where_sql, params, used_optional_columns = _build_virtual_thread_where(
         filters,
         has_bookmarks_table=_table_exists(cursor, "bookmarks"),
@@ -2067,7 +2300,8 @@ def build_virtual_thread(filters, db_file=DB_FILE):
             "body": body,
             "prompt": prompt,
             "response": response,
-            "bookmarked": row["conv_id"] in bookmarked_thread_ids,
+            "bookmarked": starred_prompt_counts.get(row["conv_id"], 0) > 0,
+            "starredPromptCount": starred_prompt_counts.get(row["conv_id"], 0),
         }
         items.append(item)
         groups_by_conv[row["conv_id"]].append(item)
@@ -2083,7 +2317,8 @@ def build_virtual_thread(filters, db_file=DB_FILE):
                 "date": first["date"],
                 "primary_time": first["primary_time"],
                 "itemCount": len(group_items),
-                "bookmarked": conv_id in bookmarked_thread_ids,
+                "bookmarked": starred_prompt_counts.get(conv_id, 0) > 0,
+                "starredPromptCount": starred_prompt_counts.get(conv_id, 0),
                 "items": group_items,
             }
         )

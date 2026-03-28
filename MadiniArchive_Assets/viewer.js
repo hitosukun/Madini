@@ -15,6 +15,7 @@ let isAllTreesExpanded = false;
 let isSmallText = false;
 let detailLoadPromises = {};
 let rawSourceLoadPromises = {};
+let rawSourceTextLoadPromises = {};
 let appBridge = null;
 let bridgeReady = false;
 // currentTreeConvIdx controls which conversation tree is expanded in compact mode.
@@ -54,6 +55,8 @@ let tabDragOverlayEl = null;
 let sidebarMode = "threads";
 let extractFilterOptions = { services: [], models: [], sourceFiles: [] };
 let recentExtractFilters = [];
+let starredExtractFilters = [];
+let starredPromptEntries = [];
 let savedExtractViews = [];
 let bookmarkListEntries = [];
 let extractPreviewTimer = null;
@@ -72,6 +75,11 @@ let appliedExtractConversationIds = null;
 let extractPreviewRequestId = 0;
 let treeStructureRevision = 0;
 const CLOSED_TAB_HISTORY_LIMIT = 20;
+const MANAGER_TAB_TITLES = {
+    recent_filters: "履歴",
+    starred_filters: "保存したフィルタ",
+    starred_prompts: "ブックマーク",
+};
 
 const ROOT_DOCK_FADE_DISTANCE = 220;
 const ROOT_DOCK_MIN_OPACITY = 0.16;
@@ -1149,6 +1157,8 @@ function getRawSourceDebugEntry(convId) {
             loading: false,
             error: "",
             data: null,
+            fullTextLoading: false,
+            fullTextError: "",
         };
     }
     return rawSourceDebugByConvId[convId];
@@ -1207,6 +1217,49 @@ function loadConversationRawSource(convId) {
     return rawSourceLoadPromises[convId];
 }
 
+function loadConversationRawText(convId) {
+    const entry = getRawSourceDebugEntry(convId);
+    if (!entry) {
+        return Promise.resolve("");
+    }
+    if (rawSourceTextLoadPromises[convId]) {
+        return rawSourceTextLoadPromises[convId];
+    }
+
+    entry.fullTextLoading = true;
+    entry.fullTextError = "";
+    rawSourceTextLoadPromises[convId] = waitForBridge().then((bridge) => {
+        if (!bridge || !bridge.fetchConversationRawText) {
+            throw new Error("Raw text bridge is not ready");
+        }
+        return new Promise((resolve, reject) => {
+            bridge.fetchConversationRawText(convId, function (result) {
+                if (!result) {
+                    resolve(null);
+                    return;
+                }
+                try {
+                    resolve(JSON.parse(result));
+                } catch (error) {
+                    reject(error);
+                }
+            });
+        });
+    }).then((detail) => {
+        entry.fullTextLoading = false;
+        entry.fullTextError = "";
+        return detail?.rawText || "";
+    }).catch((error) => {
+        entry.fullTextLoading = false;
+        entry.fullTextError = error && error.message ? error.message : "Failed to load raw text";
+        throw error;
+    }).finally(() => {
+        delete rawSourceTextLoadPromises[convId];
+    });
+
+    return rawSourceTextLoadPromises[convId];
+}
+
 function toggleConversationRawDebug(convIdx, event) {
     event?.preventDefault?.();
     event?.stopPropagation?.();
@@ -1246,6 +1299,20 @@ function toggleConversationRawDebug(convIdx, event) {
     renderRawDebugView();
 }
 
+function rerenderRawDebugConversation(convId) {
+    const convIdx = getConversationIndexById(convId);
+    if (convIdx < 0) return;
+    const activeTab = getActiveTab();
+    if (
+        activeTab &&
+        activeTab.type === "conversation" &&
+        activeTab.convIdx === convIdx &&
+        activeTab.rawDebugOpen
+    ) {
+        renderChat(convIdx, { skipTabStripReveal: true, preserveTabStripScroll: true });
+    }
+}
+
 function getConversationTabId(convIdx) {
     return `conv:${convIdx}`;
 }
@@ -1253,6 +1320,10 @@ function getConversationTabId(convIdx) {
 function getVirtualTabId() {
     virtualThreadCounter += 1;
     return `virtual:${Date.now()}:${virtualThreadCounter}`;
+}
+
+function getManagerTabId(kind) {
+    return `manager:${String(kind || "").trim()}`;
 }
 
 function getActiveTab() {
@@ -1369,6 +1440,14 @@ function buildTabSessionSnapshot() {
                         scrollTop: getVirtualTabScrollTop(tab),
                     };
                 }
+                if (tab.type === "manager") {
+                    return {
+                        id: tab.id,
+                        type: "manager",
+                        kind: tab.kind,
+                        title: tab.title || MANAGER_TAB_TITLES[tab.kind] || "Manager",
+                    };
+                }
                 return null;
             })
             .filter(Boolean),
@@ -1446,6 +1525,12 @@ function normalizeTabStateForRestore(tab) {
     if (tab.type === "virtual") {
         return normalizeVirtualTabRestoreState(tab);
     }
+    if (tab.type === "manager") {
+        return {
+            ...tab,
+            title: tab.title || MANAGER_TAB_TITLES[tab.kind] || "Manager",
+        };
+    }
     return tab;
 }
 
@@ -1480,6 +1565,19 @@ async function restoreTabFromSessionSnapshot(snapshot) {
         } catch (_error) {
             return null;
         }
+    }
+
+    if (snapshot.type === "manager") {
+        const kind = String(snapshot.kind || "").trim();
+        if (!MANAGER_TAB_TITLES[kind]) {
+            return null;
+        }
+        return {
+            id: getManagerTabId(kind),
+            type: "manager",
+            kind,
+            title: MANAGER_TAB_TITLES[kind],
+        };
     }
 
     return null;
@@ -1551,6 +1649,14 @@ function cloneTabForRestore(tab) {
             scrollTop: getVirtualTabScrollTop(tab),
         });
     }
+    if (tab.type === "manager") {
+        return {
+            id: tab.id,
+            type: "manager",
+            kind: tab.kind,
+            title: tab.title,
+        };
+    }
     return null;
 }
 
@@ -1569,7 +1675,23 @@ function updateConversationBookmarkState(convId, bookmarked) {
     const convIdx = getConversationIndexById(convId);
     if (convIdx >= 0) {
         chatData[convIdx].bookmarked = Boolean(bookmarked);
+        if (!Boolean(bookmarked)) {
+            chatData[convIdx].starredPromptCount = 0;
+        }
+        markTreeStructureDirty();
     }
+}
+
+function updateConversationStarredPromptCount(convId, delta) {
+    const convIdx = getConversationIndexById(convId);
+    if (convIdx < 0) return;
+    const currentCount = Number.isInteger(chatData[convIdx].starredPromptCount)
+        ? chatData[convIdx].starredPromptCount
+        : 0;
+    const nextCount = Math.max(0, currentCount + delta);
+    chatData[convIdx].starredPromptCount = nextCount;
+    chatData[convIdx].bookmarked = nextCount > 0;
+    markTreeStructureDirty();
 }
 
 function buildBookmarkTargetSpec(targetType, targetId, payload = {}) {
@@ -1582,6 +1704,16 @@ function buildBookmarkTargetSpec(targetType, targetId, payload = {}) {
         targetId: normalizedTargetId,
         payload: payload && typeof payload === "object" ? payload : {},
     };
+}
+
+function getBookmarkToggleGlyphHtml(bookmarked, labels = {}) {
+    const iconKind = bookmarked
+        ? labels.activeIconKind || labels.iconKind || ""
+        : labels.inactiveIconKind || labels.iconKind || "";
+    if (iconKind) {
+        return `<span class="bookmark-toggle-glyph ${escapeHTML(iconKind)}" aria-hidden="true"></span>`;
+    }
+    return bookmarked ? "★" : "☆";
 }
 
 function buildThreadBookmarkTargetSpec(conv) {
@@ -1708,10 +1840,12 @@ function buildBookmarkToggleButtonHtml(targetSpec, bookmarked, clickHandler, ext
             type="button"
             data-bookmark-target-type="${escapeHTML(bookmarkTarget.targetType)}"
             data-bookmark-target-id="${escapeHTML(bookmarkTarget.targetId)}"
+            data-bookmark-active-icon-kind="${escapeHTML(labels.activeIconKind || labels.iconKind || "")}"
+            data-bookmark-inactive-icon-kind="${escapeHTML(labels.inactiveIconKind || labels.iconKind || "")}"
             aria-pressed="${bookmarked ? "true" : "false"}"
             title="${escapeHTML(title)}"
             onclick="${clickHandler}"
-        >${bookmarked ? "★" : "☆"}</button>
+        >${getBookmarkToggleGlyphHtml(bookmarked, labels)}</button>
     `;
 }
 
@@ -1722,8 +1856,8 @@ function buildPromptBookmarkButtonHtml(targetSpec, bookmarked, clickHandler, ext
         clickHandler,
         extraClass,
         {
-            activeTitle: "Prompt bookmark is on",
-            inactiveTitle: "Bookmark this prompt",
+            activeTitle: "Prompt star is on",
+            inactiveTitle: "Star this prompt",
         }
     );
 }
@@ -1744,7 +1878,13 @@ function updateBookmarkTargetButtonState(targetSpec, bookmarked, labels = {}) {
                     ? labels.activeTitle || "Bookmark is on"
                     : labels.inactiveTitle || "Bookmark this item"
             );
-            button.textContent = bookmarked ? "★" : "☆";
+            const activeIconKind = button.dataset.bookmarkActiveIconKind || labels.activeIconKind || labels.iconKind || "";
+            const inactiveIconKind = button.dataset.bookmarkInactiveIconKind || labels.inactiveIconKind || labels.iconKind || "";
+            button.innerHTML = getBookmarkToggleGlyphHtml(bookmarked, {
+                activeIconKind,
+                inactiveIconKind,
+                iconKind: labels.iconKind || "",
+            });
         });
 }
 
@@ -1808,6 +1948,29 @@ function openVirtualTab(virtualThread) {
     setVirtualTabSelectionIndex(0, tab);
     primeSidebarFocusToCurrentView();
     scheduleTabSessionPersist();
+    return tab;
+}
+
+function openManagerTab(kind) {
+    const normalizedKind = String(kind || "").trim();
+    if (!MANAGER_TAB_TITLES[normalizedKind]) return null;
+    captureActiveVirtualTabScrollState();
+    let tab = openTabs.find((item) => item.type === "manager" && item.kind === normalizedKind);
+    if (!tab) {
+        tab = {
+            id: getManagerTabId(normalizedKind),
+            type: "manager",
+            kind: normalizedKind,
+            title: MANAGER_TAB_TITLES[normalizedKind],
+        };
+        openTabs.push(tab);
+    } else {
+        tab.title = MANAGER_TAB_TITLES[normalizedKind];
+    }
+    activeTabId = tab.id;
+    primeSidebarFocusToCurrentView();
+    scheduleTabSessionPersist();
+    renderActiveTab();
     return tab;
 }
 
@@ -2772,23 +2935,24 @@ function buildTabStripHtml() {
                 ${openTabs
                     .map((tab) => {
                         const tabConv = tab.type === "conversation" ? chatData[tab.convIdx] : null;
-                        const isBookmarked = Boolean(tabConv?.bookmarked);
-                        const kindIcon = tab.type === "virtual"
-                            ? '<span class="tab-button-kind tab-button-kind-icon tab-button-kind-filter" aria-hidden="true"></span>'
-                            : getThreadSourceIconHtml(tabConv, "tab-button-kind tab-button-kind-icon");
-                        const kindLabel = tab.type === "virtual" ? "抽出タブ" : "会話タブ";
+                        const sourceClass = getConversationSourceClass(tabConv);
+                        const starredPromptCount = Number.isInteger(tabConv?.starredPromptCount)
+                            ? tabConv.starredPromptCount
+                            : 0;
+                        const kindIcon = tab.type === "conversation"
+                            ? getCountFolderBadgeHtml(
+                                starredPromptCount,
+                                sourceClass,
+                                "tab-button-kind tab-button-kind-icon tab-star-count",
+                                "Starred prompts in this thread"
+                            )
+                            : getManagerTabKindIconHtml(tab.kind, "");
+                        const kindLabel = tab.type === "conversation"
+                            ? "会話タブ"
+                            : tab.type === "manager"
+                                ? "管理タブ"
+                                : "抽出タブ";
                         const label = escapeHTML(tab.title || "Untitled");
-                        const bookmarkButton = tab.type === "conversation"
-                            ? `
-                                <span
-                                    class="tab-bookmark ${isBookmarked ? "is-active" : ""}"
-                                    role="button"
-                                    aria-label="${isBookmarked ? "ブックマークを外す" : "ブックマークする"}"
-                                    title="${isBookmarked ? "ブックマーク済み" : "ブックマークする"}"
-                                    onclick="toggleConversationBookmarkByIndex(${tab.convIdx}, event)"
-                                >${isBookmarked ? "★" : "☆"}</span>
-                            `
-                            : "";
                         return `
                             <div
                                 class="tab-button ${tab.id === activeTabId ? "active" : ""}"
@@ -2801,7 +2965,6 @@ function buildTabStripHtml() {
                                 onmousedown="handleTabMouseDown('${escapeJsString(tab.id)}', event)"
                                 ondblclick="handleTabDoubleClick('${escapeJsString(tab.id)}', event)"
                             >
-                                ${bookmarkButton}
                                 ${kindIcon}
                                 <span class="tab-button-label">${label}</span>
                                 <span class="tab-close" role="button" aria-label="タブを閉じる" onclick="event.stopPropagation(); closeTab('${escapeJsString(tab.id)}')">×</span>
@@ -3004,6 +3167,10 @@ function renderActiveTab() {
     }
     if (activeTab.type === "virtual") {
         renderVirtualThreadTab(activeTab);
+        return;
+    }
+    if (activeTab.type === "manager") {
+        renderManagerTab(activeTab);
         return;
     }
     renderChat(activeTab.convIdx);
@@ -4271,21 +4438,41 @@ function getConversationSourceClass(conv) {
     return String(conv?.source || "").toLowerCase();
 }
 
-function getFolderIconSvgMarkup() {
+function getCountFolderBadgeHtml(count, sourceClass = "", extraClasses = "", title = "Starred prompts") {
+    const normalizedCount = Math.max(0, Number.parseInt(count, 10) || 0);
+    const className = [
+        "count-folder-badge",
+        extraClasses,
+        normalizedCount <= 0 ? "is-empty" : "",
+        sourceClass ? `source-label-${sourceClass}` : "",
+    ].filter(Boolean).join(" ");
     return `
-        <svg viewBox="0 0 20 16" focusable="false">
-            <path d="M1.75 3.5A2.25 2.25 0 0 1 4 1.25h3.1c.54 0 1.04.24 1.39.65l.78.93c.17.2.42.32.69.32H16A2.25 2.25 0 0 1 18.25 5.4v6.85A2.25 2.25 0 0 1 16 14.5H4a2.25 2.25 0 0 1-2.25-2.25V3.5Z" fill="currentColor" fill-opacity="0.18"></path>
-            <path d="M1.75 5.2A2.25 2.25 0 0 1 4 2.95h3.28c.42 0 .82.16 1.12.45l.56.54c.3.29.7.45 1.12.45H16A2.25 2.25 0 0 1 18.25 6.64v5.61A2.25 2.25 0 0 1 16 14.5H4a2.25 2.25 0 0 1-2.25-2.25V5.2Z" fill="currentColor"></path>
-        </svg>
+        <span class="${className}" title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}">
+            <svg viewBox="0 0 28 22" focusable="false" aria-hidden="true">
+                <path d="M2.75 6.5A2.75 2.75 0 0 1 5.5 3.75h4.15c.74 0 1.43.33 1.91.89l.93 1.1c.24.28.59.45.97.45H22.5A2.75 2.75 0 0 1 25.25 8.94v8.81A2.75 2.75 0 0 1 22.5 20.5h-17A2.75 2.75 0 0 1 2.75 17.75V6.5Z" fill="currentColor" fill-opacity="0.14"></path>
+                <path d="M2.75 8.2A2.75 2.75 0 0 1 5.5 5.45h4.37c.56 0 1.09.22 1.49.6l.74.72c.4.39.93.6 1.49.6H22.5A2.75 2.75 0 0 1 25.25 10.12v7.63A2.75 2.75 0 0 1 22.5 20.5h-17A2.75 2.75 0 0 1 2.75 17.75V8.2Z" fill="currentColor" fill-opacity="0.24"></path>
+                <text x="14" y="16.1" text-anchor="middle">${normalizedCount > 0 ? escapeHTML(String(normalizedCount)) : ""}</text>
+            </svg>
+        </span>
     `;
 }
 
-function getThreadSourceIconHtml(conv, extraClasses = "") {
-    const sourceClass = getConversationSourceClass(conv);
-    const className = ["thread-source-icon", extraClasses, sourceClass ? `source-label-${sourceClass}` : ""]
-        .filter(Boolean)
-        .join(" ");
-    return `<span class="${className}" aria-hidden="true">${getFolderIconSvgMarkup()}</span>`;
+function getConversationStarredPromptCount(convId) {
+    const convIdx = getConversationIndexById(convId);
+    if (convIdx < 0) return 0;
+    return Number.isInteger(chatData[convIdx]?.starredPromptCount)
+        ? chatData[convIdx].starredPromptCount
+        : 0;
+}
+
+function getManagerTabKindIconHtml(kind, extraClasses = "") {
+    const iconClass =
+        kind === "recent_filters"
+            ? "tab-button-kind-clock"
+            : kind === "starred_prompts"
+                ? "tab-button-kind-star"
+                : "tab-button-kind-filter";
+    return `<span class="tab-button-kind tab-button-kind-icon ${iconClass} ${extraClasses}" aria-hidden="true"></span>`;
 }
 
 function buildRawSourceDebugPanelHtml(conv, tab) {
@@ -4334,14 +4521,19 @@ function buildRawSourceDebugPanelHtml(conv, tab) {
     addRow("text_encoding", raw?.textEncoding);
     addRow("raw_source_id", raw?.rawSourceId);
 
-    const rawText = raw?.rawText || "";
-    const hasCopyableRawText = raw?.available !== false && raw?.rawText !== null && raw?.rawText !== undefined;
+    const previewText = raw?.rawTextPreview || "";
+    const rawTextLength = Number.isFinite(Number(raw?.rawTextLength)) ? Number(raw.rawTextLength) : previewText.length;
+    const rawTextLengthLabel = rawTextLength > 0 ? rawTextLength.toLocaleString("ja-JP") : "0";
+    const isTruncated = Boolean(raw?.rawTextTruncated);
+    const displayedRawText = previewText;
+    const hasCopyableRawText = raw?.available !== false;
     const rawBody = raw?.available === false
         ? '<div style="font-size: 13px; opacity: 0.76;">No linked raw source is stored for this conversation yet.</div>'
         : `
             <div style="margin-top: 12px;">
-                <div style="font-size: 12px; opacity: 0.7; margin-bottom: 6px;">raw_text</div>
-                <pre style="margin: 0; max-height: 320px; overflow: auto; padding: 12px; border-radius: 10px; border: 1px solid var(--border-color); background: rgba(127,127,127,0.08); color: inherit; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word;">${escapeHTML(rawText)}</pre>
+                <div style="font-size: 12px; opacity: 0.7; margin-bottom: 6px;">raw_text${isTruncated ? ` preview (${rawTextLengthLabel} chars)` : rawTextLength > 0 ? ` (${rawTextLengthLabel} chars)` : ""}</div>
+                ${isTruncated ? '<div style="font-size: 11px; opacity: 0.62; margin-bottom: 8px;">長い raw_text は最初は preview だけ表示してるよ。</div>' : ""}
+                <pre style="margin: 0; max-height: 320px; overflow: auto; padding: 12px; border-radius: 10px; border: 1px solid var(--border-color); background: rgba(127,127,127,0.08); color: inherit; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word;">${escapeHTML(displayedRawText)}</pre>
             </div>
         `;
 
@@ -4350,6 +4542,13 @@ function buildRawSourceDebugPanelHtml(conv, tab) {
             <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom: 6px;">
                 <div style="font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.82;">Raw Source Debug</div>
                 <div class="raw-debug-panel-actions">
+                    <button
+                        class="raw-debug-panel-btn"
+                        type="button"
+                        onclick="downloadConversationRawText(${Number.isInteger(convIdx) ? convIdx : -1}, this, event)"
+                        ${hasCopyableRawText ? "" : "disabled"}
+                        ${hasCopyableRawText ? 'aria-label="raw_text をダウンロード" title="raw_text をダウンロード"' : 'aria-label="ダウンロードできる raw_text がありません" title="ダウンロードできる raw_text がありません"'}
+                    ><span class="raw-debug-panel-btn-icon" aria-hidden="true">↓</span></button>
                     <button
                         class="raw-debug-panel-btn"
                         type="button"
@@ -4664,7 +4863,22 @@ function toggleMatchFilter(checked) {
 function toggleSidebarFilter(checked) {
     isSidebarFilterActive = checked;
     persistSearchPreferences();
+    syncSidebarFilterButton();
     renderTree();
+}
+
+function syncSidebarFilterButton() {
+    const button = document.getElementById("sidebar-filter-toggle");
+    if (!button) return;
+    button.classList.toggle("active", Boolean(isSidebarFilterActive));
+    button.setAttribute("aria-pressed", isSidebarFilterActive ? "true" : "false");
+    const label = isSidebarFilterActive ? "フィルタ反映中" : "フィルタを反映";
+    button.setAttribute("title", label);
+    button.setAttribute("aria-label", label);
+}
+
+function toggleSidebarFilterButton() {
+    toggleSidebarFilter(!isSidebarFilterActive);
 }
 
 function toggleAllTrees(checked) {
@@ -4971,11 +5185,12 @@ function toggleExtractModel(model, event) {
 function syncExtractSortButton() {
     const input = document.getElementById("extract-sort");
     const button = document.getElementById("extract-sort-toggle");
-    const label = document.getElementById("extract-sort-toggle-label");
-    if (!input || !button || !label) return;
+    if (!input || !button) return;
     const isDesc = input.value === "date-desc";
     button.dataset.direction = isDesc ? "desc" : "asc";
-    label.textContent = isDesc ? "降順" : "昇順";
+    const label = isDesc ? "降順" : "昇順";
+    button.setAttribute("title", label);
+    button.setAttribute("aria-label", label);
 }
 
 function toggleExtractSort(event) {
@@ -5005,9 +5220,9 @@ function renderActiveFilterSummary(filters) {
         }
     });
     if (normalizeBookmarkedFilterValue(filters.bookmarked) === "bookmarked") {
-        chips.push(`<button class="extract-chip" type="button" onclick="clearExtractFilterField('bookmarked')"><span class="extract-chip-label">bookmark: bookmarked only</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
+        chips.push(`<button class="extract-chip" type="button" onclick="clearExtractFilterField('bookmarked')"><span class="extract-chip-label">starred prompts: has starred prompt</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
     } else if (normalizeBookmarkedFilterValue(filters.bookmarked) === "not-bookmarked") {
-        chips.push(`<button class="extract-chip" type="button" onclick="clearExtractFilterField('bookmarked')"><span class="extract-chip-label">bookmark: not bookmarked</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
+        chips.push(`<button class="extract-chip" type="button" onclick="clearExtractFilterField('bookmarked')"><span class="extract-chip-label">starred prompts: without starred prompt</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
     }
 
     root.innerHTML = chips.join("");
@@ -5086,13 +5301,30 @@ function requestRecentFilters() {
     });
 }
 
-function requestSavedViews() {
+function requestStarredFilters() {
     return waitForBridge().then((bridge) => {
-        if (!bridge || !bridge.fetchSavedViews) {
+        if (!bridge || !bridge.fetchStarredFilters) {
             return [];
         }
         return new Promise((resolve) => {
-            bridge.fetchSavedViews(function (result) {
+            bridge.fetchStarredFilters(function (result) {
+                try {
+                    resolve(result ? JSON.parse(result) : []);
+                } catch (_error) {
+                    resolve([]);
+                }
+            });
+        });
+    });
+}
+
+function requestStarredPrompts() {
+    return waitForBridge().then((bridge) => {
+        if (!bridge || !bridge.fetchStarredPrompts) {
+            return [];
+        }
+        return new Promise((resolve) => {
+            bridge.fetchStarredPrompts(function (result) {
                 try {
                     resolve(result ? JSON.parse(result) : []);
                 } catch (_error) {
@@ -5125,18 +5357,18 @@ function saveRecentFilterEntry(filters) {
     });
 }
 
-function saveSavedViewEntry(name, filters, savedViewId = null) {
+function saveStarredFilterEntry(name, filters, starredFilterId = null) {
     if (!hasActiveExtractFilters(filters)) {
         return Promise.resolve(null);
     }
     return waitForBridge().then((bridge) => {
-        if (!bridge || !bridge.saveSavedView) {
+        if (!bridge || !bridge.saveStarredFilter) {
             return null;
         }
         return new Promise((resolve) => {
-            bridge.saveSavedView(
+            bridge.saveStarredFilter(
                 JSON.stringify({
-                    id: savedViewId,
+                    id: starredFilterId,
                     name,
                     filters: filters || {},
                     targetType: "virtual_thread",
@@ -5153,15 +5385,15 @@ function saveSavedViewEntry(name, filters, savedViewId = null) {
     });
 }
 
-function deleteSavedViewEntry(savedViewId) {
+function deleteStarredFilterEntry(starredFilterId) {
     return waitForBridge().then((bridge) => {
-        if (!bridge || !bridge.deleteSavedView) {
+        if (!bridge || !bridge.deleteStarredFilter) {
             return { deleted: false };
         }
         return new Promise((resolve) => {
-            bridge.deleteSavedView(
+            bridge.deleteStarredFilter(
                 JSON.stringify({
-                    id: savedViewId,
+                    id: starredFilterId,
                     targetType: "virtual_thread",
                 }),
                 function (result) {
@@ -5174,6 +5406,18 @@ function deleteSavedViewEntry(savedViewId) {
             );
         });
     });
+}
+
+function requestSavedViews() {
+    return requestStarredFilters();
+}
+
+function saveSavedViewEntry(name, filters, savedViewId = null) {
+    return saveStarredFilterEntry(name, filters, savedViewId);
+}
+
+function deleteSavedViewEntry(savedViewId) {
+    return deleteStarredFilterEntry(savedViewId);
 }
 
 function normalizeBookmarkTargetSpec(targetOrType, targetId = "", payload = {}) {
@@ -5409,10 +5653,20 @@ async function togglePromptBookmark(convIdx, messageIndex, event) {
     const nextState = !Boolean(currentState?.bookmarked);
     const result = await requestBookmarkChange(bookmarkTarget, nextState);
     updateBookmarkTargetButtonState(bookmarkTarget, result?.bookmarked, {
-        activeTitle: "Prompt bookmark is on",
-        inactiveTitle: "Bookmark this prompt",
+        activeTitle: "Prompt star is on",
+        inactiveTitle: "Star this prompt",
     });
-    void refreshBookmarkList();
+    const previousCounted = Boolean(currentState?.bookmarked) ? 1 : 0;
+    const nextCounted = Boolean(result?.bookmarked) ? 1 : 0;
+    if (previousCounted !== nextCounted) {
+        updateConversationStarredPromptCount(conv.id, nextCounted - previousCounted);
+        renderTree();
+        refreshCurrentTabStrip();
+        if (isSidebarFilterActive) {
+            refreshDirectoryFromExtractFilters(true).catch(() => {});
+        }
+    }
+    void refreshStarredPrompts();
 }
 
 async function toggleVirtualFragmentBookmark(tabId, fragmentIndex, event) {
@@ -5562,90 +5816,215 @@ function formatFilterHistoryDate(value) {
     return text.length >= 16 ? text.slice(0, 16) : text;
 }
 
-function renderRecentFilters() {
-    const root = document.getElementById("extract-history-list");
-    if (!root) return;
-
-    if (!Array.isArray(recentExtractFilters) || recentExtractFilters.length === 0) {
-        root.innerHTML = '<div class="extract-history-empty">まだフィルタ履歴はないよ</div>';
-        return;
+function serializeFilterPayload(filters) {
+    try {
+        return JSON.stringify(filters || {});
+    } catch (_error) {
+        return "{}";
     }
+}
 
-    root.innerHTML = recentExtractFilters.map((entry) => {
+function findMatchingStarredFilter(filters) {
+    const serializedFilters = serializeFilterPayload(filters);
+    return (starredExtractFilters || []).find(
+        (entry) => serializeFilterPayload(entry.filters || {}) === serializedFilters
+    ) || null;
+}
+
+function buildRecentFiltersMarkup() {
+    if (!Array.isArray(recentExtractFilters) || recentExtractFilters.length === 0) {
+        return '<div class="extract-history-empty">まだフィルタ履歴はないよ</div>';
+    }
+    return recentExtractFilters.map((entry) => {
         const serializedFilters = encodeURIComponent(JSON.stringify(entry.filters || {}));
         const usedAt = formatFilterHistoryDate(entry.lastUsedAt || entry.createdAt || "");
-        return `
-            <article class="extract-history-item">
-                <div class="extract-history-meta">
-                    <span class="extract-history-label">${escapeHTML(entry.label || "Recent Filter")}</span>
-                    <span class="extract-history-date">${escapeHTML(usedAt)}</span>
-                </div>
-                <div class="extract-history-actions">
-                    <button class="extract-history-btn" type="button" onclick="openVirtualThreadFromSavedFilter('${serializedFilters}')">Open as Virtual Thread</button>
-                    <button class="extract-history-btn" type="button" onclick="applySavedFilterToDirectory('${serializedFilters}')">Apply to Directory</button>
-                    <button class="extract-history-btn" type="button" onclick="reuseSavedFilter('${serializedFilters}')">Edit</button>
-                </div>
-            </article>
-        `;
-    }).join("");
-}
-
-async function refreshRecentFilters() {
-    recentExtractFilters = await requestRecentFilters();
-    renderRecentFilters();
-}
-
-function renderSavedViews() {
-    const root = document.getElementById("extract-saved-view-list");
-    if (!root) return;
-
-    // Saved Views Phase 2 flow stays intentionally small:
-    // save filter definition -> render list -> bookmark/apply/open through the same
-    // view record. Manual testing should cover all three entry points together.
-    if (!Array.isArray(savedExtractViews) || savedExtractViews.length === 0) {
-        root.innerHTML = '<div class="extract-history-empty">まだ saved view はないよ</div>';
-        return;
-    }
-
-    root.innerHTML = savedExtractViews.map((entry) => {
-        const serializedFilters = encodeURIComponent(JSON.stringify(entry.filters || {}));
-        const updatedAt = formatFilterHistoryDate(entry.updatedAt || entry.lastUsedAt || entry.createdAt || "");
-        const safeId = Number.parseInt(entry.id, 10);
-        const bookmarkTarget = buildSavedViewBookmarkTargetSpec(entry);
-        const bookmarkState = getCachedBookmarkState(bookmarkTarget);
+        const matchingStarredFilter = findMatchingStarredFilter(entry.filters || {});
+        const starTargetSpec = buildBookmarkTargetSpec(
+            "recent_filter",
+            String(entry.id || serializedFilters),
+            entry.filters || {}
+        );
         return `
             <article class="extract-history-item">
                 <div class="extract-history-meta">
                     <div class="extract-history-meta-main">
-                        <span class="extract-history-label">${escapeHTML(entry.name || entry.label || "Saved View")}</span>
-                        <span class="extract-history-date">${escapeHTML(updatedAt ? `updated ${updatedAt}` : "")}</span>
+                        <span class="extract-history-label">${escapeHTML(entry.label || "Recent Filter")}</span>
+                        <span class="extract-history-date">${escapeHTML(usedAt)}</span>
                     </div>
-                    ${buildBookmarkToggleButtonHtml(
-                        bookmarkTarget,
-                        Boolean(bookmarkState?.bookmarked),
-                        `toggleSavedViewBookmark(${Number.isNaN(safeId) ? 0 : safeId}, event)`,
-                        "saved-view-bookmark",
-                        {
-                            activeTitle: "Saved view bookmark is on",
-                            inactiveTitle: "Bookmark this saved view",
-                        }
-                    )}
-                </div>
-                <div class="extract-history-actions">
-                    <button class="extract-history-btn" type="button" onclick="openVirtualThreadFromStoredFilter('${serializedFilters}')">Open as Virtual Thread</button>
-                    <button class="extract-history-btn" type="button" onclick="applyStoredFilterToDirectory('${serializedFilters}')">Apply to Directory</button>
-                    <button class="extract-history-btn" type="button" onclick="loadStoredFilterIntoExtractPanel('${serializedFilters}')">Edit</button>
-                    <button class="extract-history-btn" type="button" onclick="deleteSavedViewById(${Number.isNaN(safeId) ? 0 : safeId})">Delete</button>
+                    <div class="extract-history-tools">
+                        <button class="extract-history-btn" type="button" onclick="applySavedFilterToDirectory('${serializedFilters}')">開く</button>
+                        <button class="extract-history-btn extract-history-icon-btn" type="button" title="編集" aria-label="編集" onclick="reuseSavedFilter('${serializedFilters}')">✎</button>
+                        ${buildBookmarkToggleButtonHtml(
+                            starTargetSpec,
+                            Boolean(matchingStarredFilter),
+                            `toggleRecentFilterStarByPayload('${serializedFilters}', event)`,
+                            "prompt-bookmark-btn",
+                            {
+                                iconKind: "tab-button-kind-filter",
+                                activeTitle: "保存を外す",
+                                inactiveTitle: "保存する",
+                            }
+                        )}
+                    </div>
                 </div>
             </article>
         `;
     }).join("");
 }
 
-async function refreshSavedViews() {
-    savedExtractViews = await requestSavedViews();
-    void ensureSavedViewBookmarkStates(savedExtractViews);
+function buildStarredFiltersMarkup() {
+    if (!Array.isArray(starredExtractFilters) || starredExtractFilters.length === 0) {
+        return '<div class="extract-history-empty">まだ starred filter はないよ</div>';
+    }
+    return starredExtractFilters.map((entry) => {
+        const serializedFilters = encodeURIComponent(JSON.stringify(entry.filters || {}));
+        const updatedAt = formatFilterHistoryDate(entry.updatedAt || entry.lastUsedAt || entry.createdAt || "");
+        const safeId = Number.parseInt(entry.id, 10);
+        return `
+            <article class="extract-history-item">
+                <div class="extract-history-meta">
+                    <div class="extract-history-meta-main">
+                        <span class="extract-history-label">${escapeHTML(entry.name || entry.label || "Starred Filter")}</span>
+                        <span class="extract-history-date">${escapeHTML(updatedAt ? `updated ${updatedAt}` : "")}</span>
+                    </div>
+                    <div class="extract-history-tools">
+                        <button class="extract-history-btn" type="button" onclick="applyStoredFilterToDirectory('${serializedFilters}')">開く</button>
+                        <button class="extract-history-btn extract-history-icon-btn" type="button" title="編集" aria-label="編集" onclick="loadStoredFilterIntoExtractPanel('${serializedFilters}')">✎</button>
+                        <button class="extract-history-btn" type="button" onclick="deleteStarredFilterById(${Number.isNaN(safeId) ? 0 : safeId})">Delete</button>
+                    </div>
+                </div>
+            </article>
+        `;
+    }).join("");
+}
+
+function buildStarredPromptsMarkup() {
+    if (!Array.isArray(starredPromptEntries) || starredPromptEntries.length === 0) {
+        return '<div class="extract-history-empty">まだ starred prompt はないよ</div>';
+    }
+    const groups = [];
+    const groupMap = new Map();
+    starredPromptEntries.forEach((entry) => {
+        const groupKey = String(entry.parentConversationId || entry.targetId || `group-${groups.length}`);
+        if (!groupMap.has(groupKey)) {
+            const sourceClass = getConversationSourceClass({
+                source: entry.source || "",
+            });
+            groupMap.set(groupKey, {
+                key: groupKey,
+                parentConversationId: entry.parentConversationId || "",
+                threadTitle: entry.threadTitle || "Untitled",
+                sourceClass,
+                updatedLabel: formatFilterHistoryDate(entry.updatedAt || entry.createdAt || ""),
+                entries: [],
+            });
+            groups.push(groupMap.get(groupKey));
+        }
+        groupMap.get(groupKey).entries.push(entry);
+    });
+    return groups.map((group) => {
+        const starredPromptCount = getConversationStarredPromptCount(group.parentConversationId || "");
+        const promptRows = group.entries.map((entry) => {
+            const updatedAt = formatFilterHistoryDate(entry.updatedAt || entry.createdAt || "");
+            const convId = escapeJsString(entry.parentConversationId || "");
+            const messageIndex = Number.isInteger(entry.messageIndex) ? entry.messageIndex : -1;
+            const targetSpec = buildBookmarkTargetSpec(entry.targetType, entry.targetId, entry.payload || {});
+            return `
+                <div class="extract-history-prompt-row ${entry.bookmarked === false ? "is-restorable" : ""}">
+                    <div class="extract-history-prompt-main">
+                        <span class="extract-history-label">${escapeHTML(entry.title || entry.label || "Starred Prompt")}</span>
+                        <span class="extract-history-date">${escapeHTML(updatedAt ? `updated ${updatedAt}` : "")}</span>
+                    </div>
+                    <div class="extract-history-tools">
+                        <button class="extract-history-btn" type="button" onclick="jumpToStarredPrompt('${convId}', ${messageIndex})">開く</button>
+                        ${buildBookmarkToggleButtonHtml(
+                            targetSpec,
+                            entry.bookmarked !== false,
+                            `toggleStarredPromptCard('${escapeJsString(entry.targetId || "")}', event)`,
+                            "prompt-bookmark-btn",
+                            {
+                                activeTitle: "ブックマークを外す",
+                                inactiveTitle: "元に戻す",
+                            }
+                        )}
+                    </div>
+                </div>
+            `;
+        }).join("");
+        return `
+            <article class="extract-history-item extract-history-item-starred-prompt">
+                <div class="extract-history-meta extract-history-meta-thread-card">
+                    <div class="extract-history-meta-main">
+                        <div class="extract-history-thread-row">
+                            ${getCountFolderBadgeHtml(
+                                starredPromptCount,
+                                group.sourceClass,
+                                "extract-history-thread-badge",
+                                "Starred prompts in this thread"
+                            )}
+                            <span class="extract-history-thread-title extract-history-thread-title-starred-prompt">${escapeHTML(group.threadTitle)}</span>
+                        </div>
+                        <span class="extract-history-date">${escapeHTML(group.updatedLabel ? `updated ${group.updatedLabel}` : "")}</span>
+                    </div>
+                </div>
+                <div class="extract-history-prompt-list">
+                    ${promptRows}
+                </div>
+            </article>
+        `;
+    }).join("");
+}
+
+function renderRecentFilters() {
+    const root = document.getElementById("extract-history-list");
+    if (root) {
+        root.innerHTML = buildRecentFiltersMarkup();
+    }
+}
+
+function renderSavedViews() {
+    const root = document.getElementById("extract-saved-view-list");
+    if (root) {
+        root.innerHTML = buildStarredFiltersMarkup();
+    }
+}
+
+async function refreshRecentFilters() {
+    recentExtractFilters = await requestRecentFilters();
+    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "recent_filters") {
+        renderActiveTab();
+    }
+    renderRecentFilters();
+}
+
+async function refreshStarredFilters() {
+    starredExtractFilters = await requestStarredFilters();
+    savedExtractViews = starredExtractFilters;
+    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_filters") {
+        renderActiveTab();
+    }
     renderSavedViews();
+}
+
+async function refreshStarredPrompts() {
+    starredPromptEntries = await requestStarredPrompts();
+    (starredPromptEntries || []).forEach((entry) => {
+        cacheBookmarkState({
+            targetType: entry.targetType,
+            targetId: entry.targetId,
+            payload: entry.payload || {},
+            bookmarked: entry.bookmarked !== false,
+            updatedAt: entry.updatedAt || null,
+        });
+    });
+    bookmarkListEntries = starredPromptEntries;
+    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+        renderActiveTab();
+    }
+}
+
+async function refreshSavedViews() {
+    await refreshStarredFilters();
 }
 
 function parseSavedFilterPayload(payload) {
@@ -5664,6 +6043,60 @@ function loadStoredFilterIntoExtractPanel(payload) {
 
 function reuseSavedFilter(payload) {
     loadStoredFilterIntoExtractPanel(payload);
+}
+
+async function saveRecentFilterAsStarred(payload, options = {}) {
+    const filters = parseSavedFilterPayload(payload);
+    if (!hasActiveExtractFilters(filters)) {
+        showToast("条件を入れてから保存してね");
+        return;
+    }
+    const matchingRecentEntry = (recentExtractFilters || []).find(
+        (entry) => serializeFilterPayload(entry.filters || {}) === serializeFilterPayload(filters)
+    );
+    const normalizedName = String(
+        matchingRecentEntry?.label || buildSavedViewDraftName(filters) || "Starred Filter"
+    ).trim();
+    if (!normalizedName) {
+        showToast("保存名を作れなかったよ");
+        return;
+    }
+    const saved = await saveStarredFilterEntry(normalizedName, filters);
+    if (!saved) {
+        showToast("Starred Filter を保存できなかったよ");
+        return;
+    }
+    await refreshStarredFilters();
+    showToast(`Starred Filter saved: ${normalizedName}`);
+    if (options.openManagerTab !== false) {
+        openManagerTab("starred_filters");
+    }
+}
+
+async function toggleRecentFilterStarByPayload(payload, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const filters = parseSavedFilterPayload(payload);
+    const matchingStarredFilter = findMatchingStarredFilter(filters);
+    if (matchingStarredFilter) {
+        const deleted = await deleteStarredFilterEntry(matchingStarredFilter.id);
+        if (!deleted?.deleted) {
+            showToast("保存したフィルタを外せなかったよ");
+            return;
+        }
+        await refreshStarredFilters();
+        renderRecentFilters();
+        if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "recent_filters") {
+            renderActiveTab();
+        }
+        showToast("保存を外したよ");
+        return;
+    }
+    await saveRecentFilterAsStarred(payload, { openManagerTab: false });
+    renderRecentFilters();
+    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "recent_filters") {
+        renderActiveTab();
+    }
 }
 
 function buildSavedViewDraftName(filters) {
@@ -5687,9 +6120,9 @@ function buildSavedViewDraftName(filters) {
         return `${nextFilters.dateFrom || "..."} -> ${nextFilters.dateTo || "..."}`;
     }
     if (normalizeBookmarkedFilterValue(nextFilters.bookmarked) === "bookmarked") {
-        return "bookmarked";
+        return "has starred prompt";
     }
-    return "Saved View";
+    return "Starred Filter";
 }
 
 async function saveCurrentSavedView() {
@@ -5699,34 +6132,75 @@ async function saveCurrentSavedView() {
         return;
     }
     const suggestedName = buildSavedViewDraftName(filters);
-    const enteredName = window.prompt("Saved View name (same name overwrites)", suggestedName);
+    const enteredName = window.prompt("Starred Filter name (same name overwrites)", suggestedName);
     if (enteredName === null) return;
     const normalizedName = String(enteredName || "").trim();
     if (!normalizedName) {
         showToast("名前を入れてね");
         return;
     }
-    const saved = await saveSavedViewEntry(normalizedName, filters);
+    const saved = await saveStarredFilterEntry(normalizedName, filters);
     if (!saved) {
-        showToast("Saved View を保存できなかったよ");
+        showToast("Starred Filter を保存できなかったよ");
         return;
     }
-    await refreshSavedViews();
-    showToast(`Saved View saved: ${normalizedName}`);
+    await refreshStarredFilters();
+    showToast(`Starred Filter saved: ${normalizedName}`);
+    openManagerTab("starred_filters");
 }
 
 async function deleteSavedViewById(savedViewId) {
-    const entry = (savedExtractViews || []).find((item) => String(item.id) === String(savedViewId));
+    const entry = (starredExtractFilters || []).find((item) => String(item.id) === String(savedViewId));
     if (!entry) return;
-    const confirmed = window.confirm(`Delete saved view "${entry.name || entry.label || "Saved View"}"?`);
+    const confirmed = window.confirm(`Delete starred filter "${entry.name || entry.label || "Starred Filter"}"?`);
     if (!confirmed) return;
-    const result = await deleteSavedViewEntry(savedViewId);
+    const result = await deleteStarredFilterEntry(savedViewId);
     if (!result || !result.deleted) {
-        showToast("Saved View を削除できなかったよ");
+        showToast("Starred Filter を削除できなかったよ");
         return;
     }
-    await refreshSavedViews();
-    showToast("Saved View deleted");
+    await refreshStarredFilters();
+    showToast("Starred Filter deleted");
+}
+
+async function deleteStarredFilterById(starredFilterId) {
+    await deleteSavedViewById(starredFilterId);
+}
+
+function saveCurrentStarredFilter() {
+    return saveCurrentSavedView();
+}
+
+function jumpToStarredPrompt(convId, messageIndex) {
+    const convIdx = getConversationIndexById(convId);
+    if (convIdx < 0) return;
+    openOriginConversation(convId, messageIndex);
+}
+
+async function toggleStarredPromptCard(targetId, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const entry = (starredPromptEntries || []).find((item) => item.targetId === targetId);
+    if (!entry) return;
+    const bookmarkTarget = buildBookmarkTargetSpec(entry.targetType, entry.targetId, entry.payload || {});
+    const currentState = getCachedBookmarkState(bookmarkTarget);
+    const previousBookmarked = Boolean(currentState?.bookmarked ?? (entry.bookmarked !== false));
+    const nextState = !previousBookmarked;
+    const result = await requestBookmarkChange(bookmarkTarget, nextState);
+    entry.bookmarked = Boolean(result?.bookmarked);
+    const previousCounted = previousBookmarked ? 1 : 0;
+    const nextCounted = entry.bookmarked ? 1 : 0;
+    if (previousCounted !== nextCounted && entry.parentConversationId) {
+        updateConversationStarredPromptCount(entry.parentConversationId, nextCounted - previousCounted);
+        renderTree();
+        refreshCurrentTabStrip();
+        if (isSidebarFilterActive) {
+            refreshDirectoryFromExtractFilters(true).catch(() => {});
+        }
+    }
+    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+        renderActiveTab();
+    }
 }
 
 function requestFilterOptions() {
@@ -5772,7 +6246,9 @@ function populateExtractOptions(options) {
     if (serviceButtons) {
         serviceButtons.innerHTML = (extractFilterOptions.services || [])
             .map((service) => {
-                return `<button class="extract-service-btn" type="button" data-value="${escapeHTML(service)}" onclick="setExtractService('${escapeJsString(service)}', event)">${escapeHTML(formatExtractServiceLabel(service))}</button>`;
+                const normalizedService = String(service || "").trim().toLowerCase();
+                const serviceClass = normalizedService ? ` source-label-${escapeHTML(normalizedService)}` : "";
+                return `<button class="extract-service-btn${serviceClass}" type="button" data-value="${escapeHTML(service)}" onclick="setExtractService('${escapeJsString(service)}', event)">${escapeHTML(formatExtractServiceLabel(service))}</button>`;
             })
             .join("");
         syncExtractServiceButtons();
@@ -5950,10 +6426,7 @@ async function openVirtualThreadFromFilters() {
     const filters = getExtractFilterState();
     await saveRecentFilterEntry(filters);
     await refreshRecentFilters();
-    const virtualThread = await requestVirtualThread(filters);
-    if (!virtualThread) return;
-    openVirtualTab(virtualThread);
-    renderActiveTab();
+    openManagerTab("recent_filters");
 }
 
 async function applyCurrentFiltersToDirectory() {
@@ -5965,9 +6438,8 @@ async function applyCurrentFiltersToDirectory() {
     await saveRecentFilterEntry(filters);
     await refreshRecentFilters();
     isSidebarFilterActive = true;
-    const toggle = document.getElementById("sidebar-filter-toggle");
-    if (toggle) toggle.checked = true;
     persistSearchPreferences();
+    syncSidebarFilterButton();
     switchSidebarMode("threads");
     await refreshDirectoryFromExtractFilters(true);
 }
@@ -5990,6 +6462,18 @@ async function openVirtualThreadFromSavedFilter(payload) {
 
 async function applySavedFilterToDirectory(payload) {
     await applyStoredFilterToDirectory(payload);
+}
+
+function openRecentFiltersTab() {
+    openManagerTab("recent_filters");
+}
+
+function openStarredFiltersTab() {
+    openManagerTab("starred_filters");
+}
+
+function openStarredPromptsTab() {
+    openManagerTab("starred_prompts");
 }
 
 function setupObserver() {
@@ -6056,6 +6540,13 @@ function renderTree() {
         const convIdx = conv._idx;
         const result = getCurrentConversationResult(conv);
         const hitBadge = isSearch && result.hits > 0 ? `<span class="hit-badge">${result.hits} Hits</span> ` : "";
+        const starredPromptCount = Number.isInteger(conv.starredPromptCount) ? conv.starredPromptCount : 0;
+        const starBadge = getCountFolderBadgeHtml(
+            starredPromptCount,
+            getConversationSourceClass(conv),
+            "thread-star-badge",
+            "Starred prompts in this thread"
+        );
         const shouldRenderPromptList = isAllTreesExpanded || currentTreeConvIdx === convIdx;
         const previewItems = buildPromptPreviews(conv);
         const visiblePreviewItems = getVisibleDirectoryPreviewItems(previewItems, result, directoryFilterState);
@@ -6128,7 +6619,7 @@ function renderTree() {
                     data-item-type="conversation"
                     data-conv-idx="${convIdx}"
                     data-focus-key="conv-${convIdx}"
-                    onclick="openConversationFromTree(event, ${convIdx})">${getThreadSourceIconHtml(conv)} <span class="thread-title">${hitBadge}${escapeHTML(conv.title)}</span></summary>
+                    onclick="openConversationFromTree(event, ${convIdx})"><span class="thread-title">${hitBadge}${starBadge}${escapeHTML(conv.title)}</span></summary>
                 <div class="prompt-list">${promptsHtml}</div>
             </details>`;
     });
@@ -6591,6 +7082,44 @@ function renderVirtualThreadTab(tab) {
     });
 }
 
+function renderManagerTab(tab) {
+    const viewer = document.getElementById("chat-viewer");
+    if (!viewer) return;
+    viewer.dataset.currentConv = "";
+    viewer.dataset.currentTab = tab.id;
+    viewer.dataset.currentTabType = "manager";
+    if (scrollObserver) scrollObserver.disconnect();
+
+    let bodyHtml = '<div class="extract-history-empty">表示できる内容がないよ</div>';
+    if (tab.kind === "recent_filters") {
+        bodyHtml = buildRecentFiltersMarkup();
+    } else if (tab.kind === "starred_filters") {
+        bodyHtml = buildStarredFiltersMarkup();
+    } else if (tab.kind === "starred_prompts") {
+        bodyHtml = buildStarredPromptsMarkup();
+    }
+
+    viewer.innerHTML = `
+        ${buildTabStripHtml()}
+        <div class="virtual-thread-view manager-tab-view">
+            <div class="virtual-thread-meta top-inline">
+                <h2 class="manager-tab-heading">${escapeHTML(tab.title || "Manager")}</h2>
+            </div>
+            <div class="extract-history-list manager-tab-list">
+                ${bodyHtml}
+            </div>
+        </div>
+    `;
+
+    syncTabStripRovingFocus();
+    restorePendingTabStripFocus();
+    revealActiveTabStripButton();
+    playPendingTabReorderAnimation();
+    applyTheme();
+    refreshUtilityToggleButtons();
+    updateToolbarCollapse();
+}
+
 function setVirtualFragmentActiveIndex(index, options = {}) {
     const targetTab =
         options.tab && options.tab.type === "virtual" ? options.tab : getActiveTab();
@@ -6723,6 +7252,42 @@ function setRawCopyButtonState(button, copied) {
     button.dataset.copied = copied ? "true" : "false";
 }
 
+function sanitizeDownloadFilename(name, fallback = "raw_text.txt") {
+    const normalized = String(name || "")
+        .replace(/[<>:\"/\\|?*\u0000-\u001f]/g, "-")
+        .replace(/\s+/g, " ")
+        .trim();
+    return normalized || fallback;
+}
+
+function buildRawTextDownloadFilename(conv, raw) {
+    const sourcePath = String(raw?.sourcePath || raw?.rawBytesPath || "").trim();
+    const sourceFormat = String(raw?.sourceFormat || "").trim().toLowerCase();
+    const fallbackExtension = sourceFormat === "json" ? ".json" : ".txt";
+    let fileName = sourcePath ? sourcePath.split(/[\\/]/).pop() || "" : "";
+    if (!fileName) {
+        const convIdPart = String(conv?.id || "conversation").slice(0, 32);
+        fileName = `raw-${convIdPart}${fallbackExtension}`;
+    } else if (!/\.[A-Za-z0-9]{1,12}$/.test(fileName)) {
+        fileName = `${fileName}${fallbackExtension}`;
+    }
+    return sanitizeDownloadFilename(fileName, `raw_text${fallbackExtension}`);
+}
+
+function triggerTextDownload(text, filename) {
+    const blob = new Blob([String(text || "")], { type: "text/plain;charset=utf-8" });
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => {
+        URL.revokeObjectURL(objectUrl);
+    }, 1200);
+}
+
 function copyConversationRawText(convIdx, buttonOrEvent = null, event = null) {
     const triggerButton =
         buttonOrEvent instanceof Element
@@ -6736,18 +7301,25 @@ function copyConversationRawText(convIdx, buttonOrEvent = null, event = null) {
     rawEvent?.stopPropagation?.();
     const conv = chatData[convIdx];
     const entry = conv?.id ? getRawSourceDebugEntry(conv.id) : null;
-    const rawText = entry?.data?.rawText;
-
-    if (!entry || entry.data?.available === false || rawText === null || rawText === undefined) {
+    if (!entry || entry.data?.available === false) {
         showToast("コピーできる raw_text がないよ");
         return;
     }
-
-    copyTextToClipboard(String(rawText))
-        .catch(() => {
-            fallbackCopyText(String(rawText));
+    if (triggerButton) {
+        triggerButton.disabled = true;
+    }
+    loadConversationRawText(conv.id)
+        .then((rawText) => {
+            const normalizedText = String(rawText || "");
+            if (!normalizedText) {
+                throw new Error("コピーできる raw_text がないよ");
+            }
+            return copyTextToClipboard(normalizedText)
+                .catch(() => {
+                    fallbackCopyText(normalizedText);
+                });
         })
-        .finally(() => {
+        .then(() => {
             setRawCopyButtonState(triggerButton, true);
             if (triggerButton?._copyResetTimer) {
                 window.clearTimeout(triggerButton._copyResetTimer);
@@ -6756,6 +7328,55 @@ function copyConversationRawText(convIdx, buttonOrEvent = null, event = null) {
                 triggerButton._copyResetTimer = window.setTimeout(() => {
                     setRawCopyButtonState(triggerButton, false);
                 }, 1400);
+            }
+        })
+        .catch((error) => {
+            showToast(error && error.message ? error.message : "raw_text をコピーできなかったよ");
+        })
+        .finally(() => {
+            if (triggerButton) {
+                triggerButton.disabled = false;
+            }
+            rerenderRawDebugConversation(conv.id);
+        });
+}
+
+function downloadConversationRawText(convIdx, buttonOrEvent = null, event = null) {
+    const triggerButton =
+        buttonOrEvent instanceof Element
+            ? buttonOrEvent
+            : (event?.currentTarget || buttonOrEvent?.currentTarget || null);
+    const rawEvent =
+        event && typeof event.preventDefault === "function"
+            ? event
+            : (buttonOrEvent instanceof Element ? event : buttonOrEvent);
+    rawEvent?.preventDefault?.();
+    rawEvent?.stopPropagation?.();
+    const conv = chatData[convIdx];
+    const entry = conv?.id ? getRawSourceDebugEntry(conv.id) : null;
+    if (!entry || entry.data?.available === false) {
+        showToast("ダウンロードできる raw_text がないよ");
+        return;
+    }
+    if (triggerButton) {
+        triggerButton.disabled = true;
+    }
+    loadConversationRawText(conv.id)
+        .then((rawText) => {
+            const normalizedText = String(rawText || "");
+            if (!normalizedText) {
+                throw new Error("ダウンロードできる raw_text がないよ");
+            }
+            const filename = buildRawTextDownloadFilename(conv, entry.data);
+            triggerTextDownload(normalizedText, filename);
+            showToast("raw_text をダウンロードしたよ");
+        })
+        .catch((error) => {
+            showToast(error && error.message ? error.message : "raw_text をダウンロードできなかったよ");
+        })
+        .finally(() => {
+            if (triggerButton) {
+                triggerButton.disabled = false;
             }
         });
 }
@@ -6888,7 +7509,6 @@ async function bootViewer(options = {}) {
 
         const searchBar = document.getElementById("searchBar");
         const sortSelect = document.getElementById("sort-select");
-        const sidebarFilterToggle = document.getElementById("sidebar-filter-toggle");
         const titleToggle = document.getElementById("chk-title");
         const promptToggle = document.getElementById("chk-prompt");
         const answerToggle = document.getElementById("chk-answer");
@@ -6930,7 +7550,7 @@ async function bootViewer(options = {}) {
         document.body.classList.toggle("small-text", isSmallText);
 
         isSidebarFilterActive = readBooleanPreference(STORAGE_KEYS.sidebarFilter, false);
-        if (sidebarFilterToggle) sidebarFilterToggle.checked = isSidebarFilterActive;
+        syncSidebarFilterButton();
 
         isAllTreesExpanded = readBooleanPreference(STORAGE_KEYS.treeExpand, false);
 
@@ -6958,10 +7578,10 @@ async function bootViewer(options = {}) {
         debugPerfLog("boot:before-filter-options");
         populateExtractOptions(await requestFilterOptions());
         debugPerfLog("boot:after-filter-options");
-        await refreshSavedViews();
-        debugPerfLog("boot:after-saved-views");
-        await refreshBookmarkList();
-        debugPerfLog("boot:after-bookmarks");
+        await refreshStarredFilters();
+        debugPerfLog("boot:after-starred-filters");
+        await refreshStarredPrompts();
+        debugPerfLog("boot:after-starred-prompts");
         await refreshRecentFilters();
         debugPerfLog("boot:after-recent-filters");
         switchSidebarMode(sidebarMode);

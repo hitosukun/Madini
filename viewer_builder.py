@@ -183,15 +183,34 @@ def build_viewer_html(conversations, user_themes=None, system_theme="light", sho
                 </span>
                 <span class="branch-toggle-label" aria-hidden="true">個別</span>
             </button>
-            <label class="filter-toggle">
-                <input type="checkbox" id="sidebar-filter-toggle" onchange="toggleSidebarFilter(this.checked)">
-                <span class="toggle-slider"></span>フィルタを反映
-            </label>
+            <button
+                id="sidebar-filter-toggle"
+                class="extract-manager-pill sidebar-filter-pill"
+                type="button"
+                title="フィルタを反映"
+                aria-label="フィルタを反映"
+                aria-pressed="false"
+                onclick="toggleSidebarFilterButton()"
+            >
+                <span class="tab-button-kind tab-button-kind-icon tab-button-kind-filter" aria-hidden="true"></span>
+            </button>
+            <input type="hidden" id="extract-sort" value="date-asc">
+            <button id="extract-sort-toggle" class="extract-cycle-btn extract-sort-toggle tree-sort-toggle" type="button" onclick="toggleExtractSort(event)" title="昇順" aria-label="昇順">
+                <span class="extract-sort-icon" aria-hidden="true"></span>
+            </button>
         </div>
         <div id="index-tree"></div>
         </div>
         <div id="extract-panel" class="sidebar-panel">
             <div class="extract-form">
+                <div class="extract-manager-pills" aria-label="右ペインタブ">
+                    <button class="extract-manager-pill" type="button" title="履歴" aria-label="履歴" onclick="openRecentFiltersTab()">
+                        <span class="tab-button-kind tab-button-kind-icon tab-button-kind-clock" aria-hidden="true"></span>
+                    </button>
+                    <button class="extract-manager-pill" type="button" title="ブックマーク" aria-label="ブックマーク" onclick="openStarredPromptsTab()">
+                        <span class="tab-button-kind tab-button-kind-icon tab-button-kind-star" aria-hidden="true"></span>
+                    </button>
+                </div>
                 <div class="extract-summary extract-summary-top" title="Preview count and date-based sort use the same primary time rule.">
                     <div class="extract-summary-head">
                         <div class="extract-summary-copy">
@@ -199,8 +218,8 @@ def build_viewer_html(conversations, user_themes=None, system_theme="light", sho
                             <div class="extract-summary-note" title="Preview count and date sort use primary time.">preview / sort also use primary time</div>
                         </div>
                         <div class="extract-summary-actions">
-                            <button class="action-btn header-icon-btn extract-summary-icon-btn" type="button" title="タブで開く" aria-label="タブで開く" onclick="openVirtualThreadFromFilters()">↗</button>
-                            <button class="action-btn secondary-btn header-icon-btn extract-summary-icon-btn" type="button" title="条件をクリア" aria-label="条件をクリア" onclick="clearVirtualThreadFilters()">×</button>
+                            <button class="action-btn secondary-btn header-text-btn extract-summary-text-btn" type="button" title="ディレクトリに適用" aria-label="ディレクトリに適用" onclick="applyCurrentFiltersToDirectory()">開く</button>
+                            <button class="action-btn secondary-btn header-text-btn extract-summary-text-btn" type="button" title="条件をクリア" aria-label="条件をクリア" onclick="clearVirtualThreadFilters()">クリア</button>
                         </div>
                     </div>
                     <div id="extract-active-filters" class="extract-active-filters"></div>
@@ -254,56 +273,14 @@ def build_viewer_html(conversations, user_themes=None, system_theme="light", sho
                         <datalist id="extract-source-file-options"></datalist>
                     </label>
                     <label class="extract-field">
-                        <span>sort</span>
-                        <input type="hidden" id="extract-sort" value="date-asc">
-                        <button id="extract-sort-toggle" class="extract-cycle-btn extract-sort-toggle" type="button" onclick="toggleExtractSort(event)">
-                            <span class="extract-sort-icon" aria-hidden="true"></span>
-                            <span id="extract-sort-toggle-label">昇順</span>
-                        </button>
-                    </label>
-                    <label class="extract-field">
-                        <span>bookmark</span>
+                        <span>starred prompts</span>
                         <select id="extract-bookmarked" onchange="scheduleVirtualThreadPreview()">
                             <option value="all">all</option>
-                            <option value="bookmarked">bookmarked only</option>
-                            <option value="not-bookmarked">not bookmarked</option>
+                            <option value="bookmarked">has starred prompt</option>
+                            <option value="not-bookmarked">without starred prompt</option>
                         </select>
                     </label>
                 </div>
-                <section class="extract-history-section" aria-labelledby="extract-saved-view-title">
-                    <div class="extract-history-header">
-                        <div class="extract-history-heading">
-                            <h3 id="extract-saved-view-title">Saved Views</h3>
-                            <div class="extract-history-note">named filter definitions</div>
-                        </div>
-                        <button class="extract-history-btn" type="button" onclick="saveCurrentSavedView()">Save Current View</button>
-                    </div>
-                    <div id="extract-saved-view-list" class="extract-history-list">
-                        <div class="extract-history-empty">まだ saved view はないよ</div>
-                    </div>
-                </section>
-                <section class="extract-history-section" aria-labelledby="extract-bookmark-title">
-                    <div class="extract-history-header">
-                        <div class="extract-history-heading">
-                            <h3 id="extract-bookmark-title">Bookmarks</h3>
-                            <div class="extract-history-note">generic target list</div>
-                        </div>
-                    </div>
-                    <div id="extract-bookmark-list" class="extract-history-list">
-                        <div class="extract-history-empty">まだ bookmark はないよ</div>
-                    </div>
-                </section>
-                <section class="extract-history-section" aria-labelledby="extract-history-title">
-                    <div class="extract-history-header">
-                        <div class="extract-history-heading">
-                            <h3 id="extract-history-title">Recent Filters</h3>
-                            <div class="extract-history-note">lightweight reuse history</div>
-                        </div>
-                    </div>
-                    <div id="extract-history-list" class="extract-history-list">
-                        <div class="extract-history-empty">まだフィルタ履歴はないよ</div>
-                    </div>
-                </section>
             </div>
         </div>
     </div>
