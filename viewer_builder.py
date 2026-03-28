@@ -203,14 +203,6 @@ def build_viewer_html(conversations, user_themes=None, system_theme="light", sho
         </div>
         <div id="extract-panel" class="sidebar-panel">
             <div class="extract-form">
-                <div class="extract-manager-pills" aria-label="右ペインタブ">
-                    <button class="extract-manager-pill" type="button" title="履歴" aria-label="履歴" onclick="openRecentFiltersTab()">
-                        <span class="tab-button-kind tab-button-kind-icon tab-button-kind-clock" aria-hidden="true"></span>
-                    </button>
-                    <button class="extract-manager-pill" type="button" title="ブックマーク" aria-label="ブックマーク" onclick="openStarredPromptsTab()">
-                        <span class="tab-button-kind tab-button-kind-icon tab-button-kind-star" aria-hidden="true"></span>
-                    </button>
-                </div>
                 <div class="extract-summary extract-summary-top" title="Preview count and date-based sort use the same primary time rule.">
                     <div class="extract-summary-head">
                         <div class="extract-summary-copy">

@@ -1177,7 +1177,49 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
     white-space: nowrap;
     overflow: hidden;
     box-shadow: none;
-    transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease, transform 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+    transition:
+        background 0.16s ease,
+        border-color 0.16s ease,
+        color 0.16s ease,
+        box-shadow 0.16s ease,
+        transform 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+        min-width 0.24s cubic-bezier(0.22, 1, 0.36, 1),
+        max-width 0.24s cubic-bezier(0.22, 1, 0.36, 1),
+        padding 0.24s cubic-bezier(0.22, 1, 0.36, 1),
+        gap 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.tab-button-manager {
+    flex: 0 1 auto;
+}
+.tab-button-manager-pinned {
+    min-width: 120px;
+    max-width: 190px;
+}
+.tab-button-manager-pinned:not(.active) {
+    flex: 0 0 36px;
+    min-width: 36px;
+    max-width: 36px;
+    padding: 0;
+    gap: 0;
+    justify-content: center;
+}
+.tab-button-manager-pinned:not(.active) .tab-button-label {
+    opacity: 0;
+    width: 0;
+    min-width: 0;
+    flex: 0 0 0;
+    overflow: hidden;
+    transform: translateX(-6px);
+}
+.tab-button-manager-pinned .tab-button-label {
+    transition:
+        opacity 0.2s ease,
+        width 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+        flex-basis 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+        transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.tab-button-manager-pinned.active .tab-button-label {
+    transform: translateX(0);
 }
 .tab-button:hover {
     background: color-mix(in srgb, var(--sidebar-bg) 78%, var(--bg-color));
@@ -1274,6 +1316,9 @@ body.tab-dragging .tab-strip-tabs {
 }
 .tab-button.active .tab-button-kind-icon {
     opacity: 0.96;
+}
+.tab-button-manager .tab-close {
+    display: none;
 }
 @keyframes tab-reveal-from-left {
     0% {

@@ -80,6 +80,7 @@ const MANAGER_TAB_TITLES = {
     starred_filters: "保存したフィルタ",
     starred_prompts: "ブックマーク",
 };
+const PINNED_MANAGER_TAB_KINDS = ["recent_filters", "starred_prompts"];
 
 const ROOT_DOCK_FADE_DISTANCE = 220;
 const ROOT_DOCK_MIN_OPACITY = 0.16;
@@ -1326,6 +1327,39 @@ function getManagerTabId(kind) {
     return `manager:${String(kind || "").trim()}`;
 }
 
+function buildManagerTabState(kind) {
+    const normalizedKind = String(kind || "").trim();
+    if (!MANAGER_TAB_TITLES[normalizedKind]) return null;
+    return {
+        id: getManagerTabId(normalizedKind),
+        type: "manager",
+        kind: normalizedKind,
+        title: MANAGER_TAB_TITLES[normalizedKind],
+    };
+}
+
+function ensurePinnedManagerTabs() {
+    const pinnedTabs = [];
+    PINNED_MANAGER_TAB_KINDS.forEach((kind) => {
+        let tab = openTabs.find((item) => item.type === "manager" && item.kind === kind);
+        if (!tab) {
+            tab = buildManagerTabState(kind);
+        } else {
+            tab.title = MANAGER_TAB_TITLES[kind];
+        }
+        if (tab) {
+            pinnedTabs.push(tab);
+        }
+    });
+    const otherTabs = openTabs.filter(
+        (tab) => !(tab.type === "manager" && PINNED_MANAGER_TAB_KINDS.includes(tab.kind))
+    );
+    openTabs = [...pinnedTabs, ...otherTabs];
+    if (!activeTabId && openTabs.length > 0) {
+        activeTabId = openTabs[0].id;
+    }
+}
+
 function getActiveTab() {
     // Source of truth for tab-derived reading context. Sidebar "active" sync,
     // virtual fragment selection, and session restore should all anchor here first.
@@ -1402,6 +1436,7 @@ function restoreVirtualTabScrollPosition(tab, viewer = document.getElementById("
 }
 
 function buildTabSessionSnapshot() {
+    ensurePinnedManagerTabs();
     const viewer = document.getElementById("chat-viewer");
     const activeTab = getActiveTab();
     if (viewer && activeTab && activeTab.type === "virtual") {
@@ -1586,6 +1621,7 @@ async function restoreTabFromSessionSnapshot(snapshot) {
 async function restoreOpenTabsFromSession() {
     const snapshot = readStoredTabSession();
     if (!snapshot || !Array.isArray(snapshot.tabs) || snapshot.tabs.length === 0) {
+        ensurePinnedManagerTabs();
         return false;
     }
 
@@ -1602,11 +1638,13 @@ async function restoreOpenTabsFromSession() {
         if (restoredTabs.length === 0) {
             openTabs = [];
             activeTabId = null;
+            ensurePinnedManagerTabs();
             clearStoredTabSession();
             return false;
         }
 
         openTabs = restoredTabs;
+        ensurePinnedManagerTabs();
         const nextActiveTab =
             openTabs.find((tab) => tab.id === snapshot.activeTabId) || openTabs[0];
         activeTabId = nextActiveTab ? nextActiveTab.id : null;
@@ -1908,6 +1946,7 @@ async function toggleConversationBookmarkByIndex(convIdx, event) {
 
 function ensureConversationTab(convIdx) {
     captureActiveVirtualTabScrollState();
+    ensurePinnedManagerTabs();
     const tabId = getConversationTabId(convIdx);
     let tab = openTabs.find((item) => item.id === tabId);
     if (!tab) {
@@ -1935,6 +1974,7 @@ function ensureConversationTab(convIdx) {
 
 function openVirtualTab(virtualThread) {
     captureActiveVirtualTabScrollState();
+    ensurePinnedManagerTabs();
     const tab = {
         id: getVirtualTabId(),
         type: "virtual",
@@ -1955,15 +1995,12 @@ function openManagerTab(kind) {
     const normalizedKind = String(kind || "").trim();
     if (!MANAGER_TAB_TITLES[normalizedKind]) return null;
     captureActiveVirtualTabScrollState();
+    ensurePinnedManagerTabs();
     let tab = openTabs.find((item) => item.type === "manager" && item.kind === normalizedKind);
     if (!tab) {
-        tab = {
-            id: getManagerTabId(normalizedKind),
-            type: "manager",
-            kind: normalizedKind,
-            title: MANAGER_TAB_TITLES[normalizedKind],
-        };
+        tab = buildManagerTabState(normalizedKind);
         openTabs.push(tab);
+        ensurePinnedManagerTabs();
     } else {
         tab.title = MANAGER_TAB_TITLES[normalizedKind];
     }
@@ -1979,6 +2016,9 @@ function closeTab(tabId, rememberHistory = true) {
     const index = openTabs.findIndex((tab) => tab.id === tabId);
     if (index < 0) return;
     const closedTab = openTabs[index];
+    if (closedTab?.type === "manager" && PINNED_MANAGER_TAB_KINDS.includes(closedTab.kind)) {
+        return;
+    }
     if (rememberHistory) {
         const snapshot = cloneTabForRestore(closedTab);
         if (snapshot) {
@@ -1989,6 +2029,7 @@ function closeTab(tabId, rememberHistory = true) {
         }
     }
     openTabs.splice(index, 1);
+    ensurePinnedManagerTabs();
     const fallback = openTabs[Math.max(0, index - 1)] || openTabs[0] || null;
 
     if (tabStripFocusTabId === tabId) {
@@ -2912,6 +2953,7 @@ function buildPageTopControlsHtml(activeTab = getActiveTab()) {
 }
 
 function buildTabStripHtml() {
+    ensurePinnedManagerTabs();
     if (openTabs.length === 0) return "";
     const viewerControlsMenuHtml =
         document.getElementById("viewer-controls-menu-template")?.innerHTML || "";
@@ -2952,10 +2994,12 @@ function buildTabStripHtml() {
                             : tab.type === "manager"
                                 ? "管理タブ"
                                 : "抽出タブ";
+                        const isPinnedManagerTab =
+                            tab.type === "manager" && PINNED_MANAGER_TAB_KINDS.includes(tab.kind);
                         const label = escapeHTML(tab.title || "Untitled");
                         return `
                             <div
-                                class="tab-button ${tab.id === activeTabId ? "active" : ""}"
+                                class="tab-button ${tab.id === activeTabId ? "active" : ""} ${tab.type === "manager" ? "tab-button-manager" : ""} ${isPinnedManagerTab ? "tab-button-manager-pinned" : ""}"
                                 data-tab-id="${escapeHTML(tab.id)}"
                                 role="tab"
                                 aria-label="${kindLabel}: ${label}"
@@ -2967,7 +3011,7 @@ function buildTabStripHtml() {
                             >
                                 ${kindIcon}
                                 <span class="tab-button-label">${label}</span>
-                                <span class="tab-close" role="button" aria-label="タブを閉じる" onclick="event.stopPropagation(); closeTab('${escapeJsString(tab.id)}')">×</span>
+                                ${isPinnedManagerTab ? "" : `<span class="tab-close" role="button" aria-label="タブを閉じる" onclick="event.stopPropagation(); closeTab('${escapeJsString(tab.id)}')">×</span>`}
                             </div>
                         `;
                     })
@@ -7595,6 +7639,13 @@ async function bootViewer(options = {}) {
         await executeSearch();
         debugPerfLog("boot:after-execute-search");
         await restoreOpenTabsFromSession();
+        ensurePinnedManagerTabs();
+        if (!getActiveTab() && openTabs.length > 0) {
+            activeTabId = openTabs[0].id;
+        }
+        if (getActiveTab()) {
+            renderActiveTab();
+        }
         debugPerfLog("boot:after-restore-tabs");
         window.requestAnimationFrame(() => {
             ensureInitialAppFocus();
