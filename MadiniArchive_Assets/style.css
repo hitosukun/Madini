@@ -16,6 +16,7 @@ body.small-text {
 }
 
 body { display: flex; height: 100vh; margin: 0; overflow: hidden; background: var(--bg-color); color: var(--text-color); transition: background 0.4s ease, color 0.4s ease; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; accent-color: var(--accent-color); caret-color: var(--accent-color); }
+body.frameless-host { padding-top: 0; }
 ::selection {
     background: color-mix(in srgb, var(--accent-color) 24%, transparent);
     color: inherit;
@@ -55,6 +56,7 @@ body.command-nav-active .conversation-root-prompt.is-sidebar-hidden {
 
 #sidebar { width: 292px; border-right: 0; display: flex; flex-direction: column; background: color-mix(in srgb, var(--sidebar-bg) 94%, var(--bg-color)); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif; transition: background 0.4s ease; z-index: 100; overflow: hidden; }
 .sidebar-header { position: relative; padding: 10px 12px 10px 12px; border-bottom: 0; color: var(--sidebar-text); background: transparent; display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+body.frameless-host .sidebar-header { padding-top: 18px; padding-left: 26px; }
 .sidebar-mode-switch {
     display: flex;
     gap: 0;
@@ -68,6 +70,12 @@ body.command-nav-active .conversation-root-prompt.is-sidebar-hidden {
         inset 0 1px 0 color-mix(in srgb, white 10%, transparent),
         inset 0 -1px 0 color-mix(in srgb, black 10%, transparent);
     overflow: hidden;
+}
+body.frameless-host .sidebar-mode-switch {
+    width: 220px;
+    max-width: calc(100% - 8px);
+    align-self: flex-start;
+    margin-bottom: 10px;
 }
 .sidebar-mode-switch::before {
     content: "";
@@ -107,6 +115,10 @@ body.command-nav-active .conversation-root-prompt.is-sidebar-hidden {
     align-items: center;
     justify-content: center;
     gap: 6px;
+}
+body.frameless-host .sidebar-mode-btn {
+    min-height: 27px;
+    font-size: 0.76rem;
 }
 .sidebar-mode-btn:hover {
     color: color-mix(in srgb, var(--text-color) 84%, var(--sidebar-text));
@@ -1047,6 +1059,9 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
     border-bottom: 1px solid color-mix(in srgb, var(--border-color) 44%, transparent);
     overflow: visible;
 }
+body.frameless-host .tab-strip {
+    padding-top: 10px;
+}
 .tab-strip-pinned {
     display: flex;
     align-items: center;
@@ -1055,6 +1070,12 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
     z-index: 8;
     padding-left: 0;
     background: transparent;
+}
+.tab-strip-pinned-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
 }
 .tab-strip-scroll-shell {
     min-width: 0;
