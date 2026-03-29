@@ -183,21 +183,23 @@ def build_viewer_html(conversations, user_themes=None, system_theme="light", sho
                 </span>
                 <span class="branch-toggle-label" aria-hidden="true">個別</span>
             </button>
-            <button
-                id="sidebar-filter-toggle"
-                class="extract-manager-pill sidebar-filter-pill"
-                type="button"
-                title="フィルタを反映"
-                aria-label="フィルタを反映"
-                aria-pressed="false"
-                onclick="toggleSidebarFilterButton()"
-            >
-                <span class="tab-button-kind tab-button-kind-icon tab-button-kind-filter" aria-hidden="true"></span>
-            </button>
-            <input type="hidden" id="extract-sort" value="date-asc">
-            <button id="extract-sort-toggle" class="extract-cycle-btn extract-sort-toggle tree-sort-toggle" type="button" onclick="toggleExtractSort(event)" title="昇順" aria-label="昇順">
-                <span class="extract-sort-icon" aria-hidden="true"></span>
-            </button>
+            <div class="tree-actions-trailing">
+                <button
+                    id="sidebar-filter-toggle"
+                    class="extract-manager-pill sidebar-filter-pill circle-pill circle-pill-md"
+                    type="button"
+                    title="フィルタを反映"
+                    aria-label="フィルタを反映"
+                    aria-pressed="false"
+                    onclick="toggleSidebarFilterButton()"
+                >
+                    <span class="tab-button-kind tab-button-kind-icon tab-button-kind-filter" aria-hidden="true"></span>
+                </button>
+                <input type="hidden" id="extract-sort" value="date-asc">
+                <button id="extract-sort-toggle" class="extract-cycle-btn extract-sort-toggle tree-sort-toggle circle-pill circle-pill-md" type="button" onclick="toggleExtractSort(event)" title="昇順" aria-label="昇順">
+                    <span class="extract-sort-icon" aria-hidden="true"></span>
+                </button>
+            </div>
         </div>
         <div id="index-tree"></div>
         </div>

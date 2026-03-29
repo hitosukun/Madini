@@ -69,6 +69,8 @@ let bookmarkStatesByKey = {};
 let promptBookmarkLoadPromises = {};
 let virtualFragmentBookmarkLoadPromises = {};
 let savedViewBookmarkLoadPromises = {};
+let collapsedMessageStateByKey = {};
+let answerCollapseOverrideByKey = {};
 let isViewerToolsOpen = false;
 let isExtractModelMenuOpen = false;
 let appliedExtractConversationIds = null;
@@ -1864,6 +1866,8 @@ function buildBookmarkToggleButtonHtml(targetSpec, bookmarked, clickHandler, ext
     const buttonClasses = [
         "bookmark-target-toggle",
         "prompt-bookmark-btn",
+        "circle-pill",
+        "circle-pill-sm",
         extraClass,
         bookmarked ? "is-active" : "",
     ]
@@ -1888,16 +1892,39 @@ function buildBookmarkToggleButtonHtml(targetSpec, bookmarked, clickHandler, ext
 }
 
 function buildPromptBookmarkButtonHtml(targetSpec, bookmarked, clickHandler, extraClass = "") {
-    return buildBookmarkToggleButtonHtml(
-        targetSpec,
-        bookmarked,
-        clickHandler,
+    const bookmarkTarget = normalizeBookmarkTargetSpec(targetSpec);
+    const buttonClasses = [
+        "bookmark-target-toggle",
         extraClass,
-        {
-            activeTitle: "Prompt star is on",
-            inactiveTitle: "Star this prompt",
-        }
-    );
+        bookmarked ? "is-active" : "",
+    ]
+        .filter(Boolean)
+        .join(" ");
+    const title = bookmarked ? "Prompt star is on" : "Star this prompt";
+    return `
+        <button
+            class="${buttonClasses}"
+            type="button"
+            data-bookmark-target-type="${escapeHTML(bookmarkTarget.targetType)}"
+            data-bookmark-target-id="${escapeHTML(bookmarkTarget.targetId)}"
+            aria-pressed="${bookmarked ? "true" : "false"}"
+            title="${escapeHTML(title)}"
+            onclick="${clickHandler}"
+        >${getBookmarkToggleGlyphHtml(bookmarked)}</button>
+    `;
+}
+
+function animateCirclePillToggle(button, becameActive) {
+    if (!button?.classList?.contains("circle-pill")) return;
+    button.classList.remove("circle-pill-activated", "circle-pill-deactivated");
+    void button.offsetWidth;
+    button.classList.add(becameActive ? "circle-pill-activated" : "circle-pill-deactivated");
+    if (button._circlePillAnimationTimer) {
+        window.clearTimeout(button._circlePillAnimationTimer);
+    }
+    button._circlePillAnimationTimer = window.setTimeout(() => {
+        button.classList.remove("circle-pill-activated", "circle-pill-deactivated");
+    }, 320);
 }
 
 function updateBookmarkTargetButtonState(targetSpec, bookmarked, labels = {}) {
@@ -1908,6 +1935,7 @@ function updateBookmarkTargetButtonState(targetSpec, bookmarked, labels = {}) {
             `.bookmark-target-toggle[data-bookmark-target-type="${escapeJsString(bookmarkTarget.targetType)}"][data-bookmark-target-id="${escapeJsString(bookmarkTarget.targetId)}"]`
         )
         .forEach((button) => {
+            const wasActive = button.classList.contains("is-active");
             button.classList.toggle("is-active", Boolean(bookmarked));
             button.setAttribute("aria-pressed", bookmarked ? "true" : "false");
             button.setAttribute(
@@ -1923,6 +1951,9 @@ function updateBookmarkTargetButtonState(targetSpec, bookmarked, labels = {}) {
                 inactiveIconKind,
                 iconKind: labels.iconKind || "",
             });
+            if (wasActive !== Boolean(bookmarked)) {
+                animateCirclePillToggle(button, Boolean(bookmarked));
+            }
         });
 }
 
@@ -2011,6 +2042,30 @@ function openManagerTab(kind) {
     return tab;
 }
 
+function isPinnedManagerTab(tab) {
+    return Boolean(tab?.type === "manager" && PINNED_MANAGER_TAB_KINDS.includes(tab.kind));
+}
+
+function getCloseFallbackTab(closedIndex) {
+    if (!Array.isArray(openTabs) || openTabs.length === 0) return null;
+    const preferredIndex = Math.min(Math.max(Number(closedIndex) || 0, 0), openTabs.length - 1);
+    let bestTab = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    let bestIndex = Number.POSITIVE_INFINITY;
+
+    openTabs.forEach((tab, index) => {
+        if (isPinnedManagerTab(tab)) return;
+        const distance = Math.abs(index - preferredIndex);
+        if (distance < bestDistance || (distance === bestDistance && index < bestIndex)) {
+            bestTab = tab;
+            bestDistance = distance;
+            bestIndex = index;
+        }
+    });
+
+    return bestTab || openTabs[preferredIndex] || openTabs[0] || null;
+}
+
 function closeTab(tabId, rememberHistory = true) {
     captureActiveVirtualTabScrollState();
     const index = openTabs.findIndex((tab) => tab.id === tabId);
@@ -2030,7 +2085,7 @@ function closeTab(tabId, rememberHistory = true) {
     }
     openTabs.splice(index, 1);
     ensurePinnedManagerTabs();
-    const fallback = openTabs[Math.max(0, index - 1)] || openTabs[0] || null;
+    const fallback = getCloseFallbackTab(index);
 
     if (tabStripFocusTabId === tabId) {
         tabStripFocusTabId = fallback ? fallback.id : null;
@@ -2928,6 +2983,7 @@ function refreshCurrentTabStrip() {
     }
     syncViewerToolsState();
     updateToolbarCollapse();
+    syncTabStripInsets();
 }
 
 function buildPageTopControlsHtml(activeTab = getActiveTab()) {
@@ -2945,7 +3001,7 @@ function buildPageTopControlsHtml(activeTab = getActiveTab()) {
                     aria-expanded="${activeTab.rawDebugOpen ? "true" : "false"}"
                     onclick="toggleConversationRawDebug(${activeTab.convIdx}, event)"
                 ><span class="raw-toggle-label">Raw</span><span class="viewer-settings-trigger-caret raw-toggle-caret" aria-hidden="true"></span></button>
-                <button class="action-btn header-icon-btn" title="コピー" aria-label="コピー" onclick="copyFullText(${activeTab.convIdx})">⧉</button>
+                                <button class="action-btn header-icon-btn circle-pill circle-pill-md" title="コピー" aria-label="コピー" onclick="copyFullText(${activeTab.convIdx})">⧉</button>
             </div>
         `
         : "";
@@ -2971,51 +3027,79 @@ function buildTabStripHtml() {
             </div>
         </div>
     `;
+    const pinnedTabsHtml = openTabs
+        .filter((tab) => tab.type === "manager" && PINNED_MANAGER_TAB_KINDS.includes(tab.kind))
+        .map((tab) => {
+            const kindIcon = getManagerTabKindIconHtml(tab.kind, "");
+            const label = escapeHTML(tab.title || "Untitled");
+            return `
+                <div
+                    class="tab-button ${tab.id === activeTabId ? "active" : ""} tab-button-manager tab-button-manager-pinned"
+                    data-tab-id="${escapeHTML(tab.id)}"
+                    role="tab"
+                    aria-label="管理タブ: ${label}"
+                    aria-selected="${tab.id === activeTabId ? "true" : "false"}"
+                    tabindex="${tab.id === focusableTabId ? "0" : "-1"}"
+                    onclick="activateTab('${escapeJsString(tab.id)}', event)"
+                    onmousedown="handleTabMouseDown('${escapeJsString(tab.id)}', event)"
+                    ondblclick="handleTabDoubleClick('${escapeJsString(tab.id)}', event)"
+                >
+                    ${kindIcon}
+                    <span class="tab-button-label">${label}</span>
+                </div>
+            `;
+        })
+        .join("");
+    const scrollableTabsHtml = openTabs
+        .filter((tab) => !(tab.type === "manager" && PINNED_MANAGER_TAB_KINDS.includes(tab.kind)))
+        .map((tab) => {
+            const tabConv = tab.type === "conversation" ? chatData[tab.convIdx] : null;
+            const sourceClass = getConversationSourceClass(tabConv);
+            const starredPromptCount = Number.isInteger(tabConv?.starredPromptCount)
+                ? tabConv.starredPromptCount
+                : 0;
+            const kindIcon = tab.type === "conversation"
+                ? getCountFolderBadgeHtml(
+                    starredPromptCount,
+                    sourceClass,
+                    "tab-button-kind tab-button-kind-icon tab-star-count",
+                    "Starred prompts in this thread"
+                )
+                : getManagerTabKindIconHtml(tab.kind, "");
+            const kindLabel = tab.type === "conversation"
+                ? "会話タブ"
+                : tab.type === "manager"
+                    ? "管理タブ"
+                    : "抽出タブ";
+            const label = escapeHTML(tab.title || "Untitled");
+            return `
+                <div
+                    class="tab-button ${tab.id === activeTabId ? "active" : ""} ${tab.type === "manager" ? "tab-button-manager" : ""}"
+                    data-tab-id="${escapeHTML(tab.id)}"
+                    role="tab"
+                    aria-label="${kindLabel}: ${label}"
+                    aria-selected="${tab.id === activeTabId ? "true" : "false"}"
+                    tabindex="${tab.id === focusableTabId ? "0" : "-1"}"
+                    onclick="activateTab('${escapeJsString(tab.id)}', event)"
+                    onmousedown="handleTabMouseDown('${escapeJsString(tab.id)}', event)"
+                    ondblclick="handleTabDoubleClick('${escapeJsString(tab.id)}', event)"
+                >
+                    ${kindIcon}
+                    <span class="tab-button-label">${label}</span>
+                    <span class="tab-close" role="button" aria-label="タブを閉じる" onclick="event.stopPropagation(); closeTab('${escapeJsString(tab.id)}')">×</span>
+                </div>
+            `;
+        })
+        .join("");
     return `
         <div class="tab-strip">
-            <div class="tab-strip-tabs" role="tablist" aria-label="Open tabs">
-                ${openTabs
-                    .map((tab) => {
-                        const tabConv = tab.type === "conversation" ? chatData[tab.convIdx] : null;
-                        const sourceClass = getConversationSourceClass(tabConv);
-                        const starredPromptCount = Number.isInteger(tabConv?.starredPromptCount)
-                            ? tabConv.starredPromptCount
-                            : 0;
-                        const kindIcon = tab.type === "conversation"
-                            ? getCountFolderBadgeHtml(
-                                starredPromptCount,
-                                sourceClass,
-                                "tab-button-kind tab-button-kind-icon tab-star-count",
-                                "Starred prompts in this thread"
-                            )
-                            : getManagerTabKindIconHtml(tab.kind, "");
-                        const kindLabel = tab.type === "conversation"
-                            ? "会話タブ"
-                            : tab.type === "manager"
-                                ? "管理タブ"
-                                : "抽出タブ";
-                        const isPinnedManagerTab =
-                            tab.type === "manager" && PINNED_MANAGER_TAB_KINDS.includes(tab.kind);
-                        const label = escapeHTML(tab.title || "Untitled");
-                        return `
-                            <div
-                                class="tab-button ${tab.id === activeTabId ? "active" : ""} ${tab.type === "manager" ? "tab-button-manager" : ""} ${isPinnedManagerTab ? "tab-button-manager-pinned" : ""}"
-                                data-tab-id="${escapeHTML(tab.id)}"
-                                role="tab"
-                                aria-label="${kindLabel}: ${label}"
-                                aria-selected="${tab.id === activeTabId ? "true" : "false"}"
-                                tabindex="${tab.id === focusableTabId ? "0" : "-1"}"
-                                onclick="activateTab('${escapeJsString(tab.id)}', event)"
-                                onmousedown="handleTabMouseDown('${escapeJsString(tab.id)}', event)"
-                                ondblclick="handleTabDoubleClick('${escapeJsString(tab.id)}', event)"
-                            >
-                                ${kindIcon}
-                                <span class="tab-button-label">${label}</span>
-                                ${isPinnedManagerTab ? "" : `<span class="tab-close" role="button" aria-label="タブを閉じる" onclick="event.stopPropagation(); closeTab('${escapeJsString(tab.id)}')">×</span>`}
-                            </div>
-                        `;
-                    })
-                    .join("")}
+            <div class="tab-strip-pinned" role="tablist" aria-label="Pinned tabs">
+                ${pinnedTabsHtml}
+            </div>
+            <div class="tab-strip-scroll-shell">
+                <div class="tab-strip-tabs" role="tablist" aria-label="Open tabs">
+                    ${scrollableTabsHtml}
+                </div>
             </div>
             ${toolbarHtml}
         </div>
@@ -3148,7 +3232,19 @@ function updateToolbarCollapse() {
     const shouldCollapse = availableInlineWidth < inlineWidth;
     shell.classList.toggle("is-collapsed", shouldCollapse);
     shell.dataset.toolbarCollapsed = shouldCollapse ? "true" : "false";
+    syncTabStripInsets();
     updateCodeBlockStickyOffset(viewer);
+}
+
+function syncTabStripInsets() {
+    const strip = document.querySelector(".tab-strip");
+    if (!strip) return;
+    const pinned = strip.querySelector(".tab-strip-pinned");
+    const toolbar = strip.querySelector(".viewer-toolbar-shell");
+    const leftInset = Math.ceil(pinned?.getBoundingClientRect?.().width || 0);
+    const rightInset = Math.ceil(toolbar?.getBoundingClientRect?.().width || 0);
+    strip.style.setProperty("--tab-strip-left-inset", `${leftInset}px`);
+    strip.style.setProperty("--tab-strip-right-inset", `${rightInset}px`);
 }
 
 function openViewerTools() {
@@ -4587,14 +4683,14 @@ function buildRawSourceDebugPanelHtml(conv, tab) {
                 <div style="font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.82;">Raw Source Debug</div>
                 <div class="raw-debug-panel-actions">
                     <button
-                        class="raw-debug-panel-btn"
+                        class="raw-debug-panel-btn circle-pill circle-pill-sm"
                         type="button"
                         onclick="downloadConversationRawText(${Number.isInteger(convIdx) ? convIdx : -1}, this, event)"
                         ${hasCopyableRawText ? "" : "disabled"}
                         ${hasCopyableRawText ? 'aria-label="raw_text をダウンロード" title="raw_text をダウンロード"' : 'aria-label="ダウンロードできる raw_text がありません" title="ダウンロードできる raw_text がありません"'}
                     ><span class="raw-debug-panel-btn-icon" aria-hidden="true">↓</span></button>
                     <button
-                        class="raw-debug-panel-btn"
+                        class="raw-debug-panel-btn circle-pill circle-pill-sm"
                         type="button"
                         onclick="copyConversationRawText(${Number.isInteger(convIdx) ? convIdx : -1}, this, event)"
                         ${hasCopyableRawText ? "" : "disabled"}
@@ -4701,17 +4797,54 @@ function escapeRegex(str) {
 }
 
 function protectCodeSegments(sourceText, placeholders) {
-    let nextText = sourceText;
-    nextText = nextText.replace(/```([^\n`]*)\n([\s\S]*?)```/g, (_match, _info, code) => {
-        return placeholders.put(`<pre><code>${escapeHTML(code.replace(/\n$/, ""))}</code></pre>`);
-    });
-    nextText = nextText.replace(/```([\s\S]*?)```/g, (_match, code) => {
-        return placeholders.put(`<pre><code>${escapeHTML(code.trim())}</code></pre>`);
-    });
-    nextText = nextText.replace(/`([^`\n]+)`/g, (_match, code) => {
+    const source = String(sourceText || "");
+    const lines = source.match(/[^\r\n]*(?:\r?\n|$)/g) || [];
+    const output = [];
+
+    for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
+        if (!line) continue;
+
+        const openMatch = line.match(/^(?: {0,3})(`{3,}|~{3,})([^\r\n]*)\r?\n?$/);
+        if (!openMatch) {
+            output.push(line);
+            continue;
+        }
+
+        const [, fence, infoRaw] = openMatch;
+        const fenceChar = fence[0];
+        const fenceLength = fence.length;
+        const info = String(infoRaw || "").trim().split(/\s+/, 1)[0] || "";
+        const contentLines = [];
+        let closeIndex = -1;
+
+        for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+            const candidate = lines[cursor];
+            const closePattern = new RegExp(`^(?: {0,3})${escapeRegex(fenceChar.repeat(fenceLength))}${fenceChar}*[ \\t]*\\r?\\n?$`);
+            if (closePattern.test(candidate)) {
+                closeIndex = cursor;
+                break;
+            }
+            contentLines.push(candidate);
+        }
+
+        if (closeIndex === -1) {
+            output.push(line);
+            continue;
+        }
+
+        let code = contentLines.join("");
+        code = code.replace(/\r?\n$/, "");
+        const languageClass = info ? ` class="language-${escapeHTML(info.toLowerCase())}"` : "";
+        output.push(
+            placeholders.put(`<pre><code${languageClass}>${escapeHTML(code)}</code></pre>`)
+        );
+        index = closeIndex;
+    }
+
+    return output.join("").replace(/`([^`\n]+)`/g, (_match, code) => {
         return placeholders.put(`<code>${escapeHTML(code)}</code>`);
     });
-    return nextText;
 }
 
 function renderMathSegments(sourceText, placeholders) {
@@ -4846,6 +4979,122 @@ function renderContent(text) {
     html = applyBasicMarkdown(html);
     html = mathPlaceholders.restore(html);
     return codePlaceholders.restore(html);
+}
+
+function renderPromptContent(text) {
+    return escapeHTML(String(text || "")).replace(/\n/g, "<br>");
+}
+
+function getCollapsedMessageStateKey(convOrId, messageIndex) {
+    const convId =
+        convOrId && typeof convOrId === "object"
+            ? String(convOrId.id || "")
+            : String(convOrId || "");
+    return `${convId}:${Number.isInteger(messageIndex) ? messageIndex : -1}`;
+}
+
+function isMessageCollapsed(convOrId, messageIndex) {
+    return Boolean(collapsedMessageStateByKey[getCollapsedMessageStateKey(convOrId, messageIndex)]);
+}
+
+function setMessageCollapsed(convOrId, messageIndex, collapsed) {
+    const key = getCollapsedMessageStateKey(convOrId, messageIndex);
+    if (collapsed) {
+        collapsedMessageStateByKey[key] = true;
+        return;
+    }
+    delete collapsedMessageStateByKey[key];
+}
+
+function getTurnStartMessageIndex(conv, messageIndex) {
+    if (!conv || !Array.isArray(conv.messages) || !Number.isInteger(messageIndex)) {
+        return messageIndex;
+    }
+    for (let index = Math.min(messageIndex, conv.messages.length - 1); index >= 0; index -= 1) {
+        if (conv.messages[index]?.role === "user") {
+            return index;
+        }
+    }
+    return messageIndex;
+}
+
+function getAnswerCollapseOverrideStateKey(convOrId, messageIndex) {
+    const convId =
+        convOrId && typeof convOrId === "object"
+            ? String(convOrId.id || "")
+            : String(convOrId || "");
+    return `${convId}:${Number.isInteger(messageIndex) ? messageIndex : -1}`;
+}
+
+function getAnswerCollapseOverride(convOrId, messageIndex) {
+    return answerCollapseOverrideByKey[getAnswerCollapseOverrideStateKey(convOrId, messageIndex)] || null;
+}
+
+function setAnswerCollapseOverride(convOrId, messageIndex, nextOverride) {
+    const key = getAnswerCollapseOverrideStateKey(convOrId, messageIndex);
+    if (nextOverride === "open" || nextOverride === "closed") {
+        answerCollapseOverrideByKey[key] = nextOverride;
+        return;
+    }
+    delete answerCollapseOverrideByKey[key];
+}
+
+function isAnswerMessageCollapsed(conv, messageIndex) {
+    const turnStartIndex = getTurnStartMessageIndex(conv, messageIndex);
+    const turnCollapsed = isMessageCollapsed(conv, turnStartIndex);
+    const override = getAnswerCollapseOverride(conv, messageIndex);
+    if (turnCollapsed) {
+        return override !== "open";
+    }
+    return override === "closed";
+}
+
+function buildMessageAvatarButtonHtml(convIdx, messageIndex, role, options = {}) {
+    const conv = chatData[convIdx];
+    const isUser = role === "user";
+    if (isUser) {
+        const collapsed = isMessageCollapsed(conv, messageIndex);
+        const title = collapsed ? "プロンプトと回答を開く" : "プロンプトと回答を折りたたむ";
+        return `
+            <button
+                class="avatar user-icon message-avatar-toggle${collapsed ? " is-collapsed" : ""}"
+                type="button"
+                aria-pressed="${collapsed ? "true" : "false"}"
+                title="${title}"
+                onclick="toggleMessageCollapsed(${convIdx}, ${messageIndex}, event)"
+            ></button>`;
+    }
+    const collapsed = isAnswerMessageCollapsed(conv, messageIndex);
+    const title = collapsed ? "回答を開く" : "回答を折りたたむ";
+    return `
+        <button
+            class="avatar assist-icon message-avatar-toggle${collapsed ? " is-collapsed" : ""}"
+            type="button"
+            aria-pressed="${collapsed ? "true" : "false"}"
+            title="${title}"
+            aria-label="${title}"
+            onclick="toggleAnswerMessageCollapsed(${convIdx}, ${messageIndex}, event)"
+        ></button>`;
+}
+
+function buildCollapsedMessagePreview(text, maxLength = 120) {
+    const normalized = String(text || "").replace(/\s+/g, " ").trim();
+    if (!normalized) return "…";
+    if (normalized.length <= maxLength) return normalized;
+    return `${normalized.slice(0, maxLength).trimEnd()}…`;
+}
+
+function buildPromptCopyButtonHtml(convIdx, messageIndex) {
+    return `
+        <div class="prompt-bubble-copy-track">
+            <button
+                class="prompt-bubble-copy"
+                type="button"
+                title="プロンプトをコピー"
+                aria-label="プロンプトをコピー"
+                onclick="copyPromptMessage(${convIdx}, ${messageIndex}, event)"
+            ><span aria-hidden="true">⧉</span></button>
+        </div>`;
 }
 
 function getCurrentConversationResult(conv) {
@@ -5713,6 +5962,72 @@ async function togglePromptBookmark(convIdx, messageIndex, event) {
     void refreshStarredPrompts();
 }
 
+async function copyPromptMessage(convIdx, messageIndex, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const conv = await loadConversationDetail(convIdx);
+    const message = conv?.messages?.[messageIndex];
+    if (!message || message.role !== "user") return;
+    const text = String(message.text || "");
+    copyTextToClipboard(text)
+        .then(() => showToast("プロンプトをコピーしたよ"))
+        .catch(() => {
+            fallbackCopyText(text);
+            showToast("プロンプトをコピーしたよ");
+        });
+}
+
+function toggleMessageCollapsed(convIdx, messageIndex, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const conv = chatData[convIdx];
+    if (!conv?.id) return;
+    const turnStartIndex = getTurnStartMessageIndex(conv, messageIndex);
+    const nextCollapsed = !isMessageCollapsed(conv, turnStartIndex);
+    setMessageCollapsed(conv, turnStartIndex, nextCollapsed);
+    const viewer = document.getElementById("chat-viewer");
+    const previousScrollTop = viewer ? viewer.scrollTop : 0;
+    window.setTimeout(() => {
+        renderChat(convIdx, { preserveTabStripScroll: true });
+        window.requestAnimationFrame(() => {
+            const nextViewer = document.getElementById("chat-viewer");
+            if (nextViewer) {
+                nextViewer.scrollTop = previousScrollTop;
+            }
+        });
+    }, 95);
+}
+
+function toggleAnswerMessageCollapsed(convIdx, messageIndex, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const conv = chatData[convIdx];
+    const message = conv?.messages?.[messageIndex];
+    if (!conv?.id || !message || message.role === "user") return;
+
+    const turnStartIndex = getTurnStartMessageIndex(conv, messageIndex);
+    const turnCollapsed = isMessageCollapsed(conv, turnStartIndex);
+    const currentlyCollapsed = isAnswerMessageCollapsed(conv, messageIndex);
+
+    if (turnCollapsed) {
+        setAnswerCollapseOverride(conv, messageIndex, currentlyCollapsed ? "open" : null);
+    } else {
+        setAnswerCollapseOverride(conv, messageIndex, currentlyCollapsed ? null : "closed");
+    }
+
+    const viewer = document.getElementById("chat-viewer");
+    const previousScrollTop = viewer ? viewer.scrollTop : 0;
+    window.setTimeout(() => {
+        renderChat(convIdx, { preserveTabStripScroll: true });
+        window.requestAnimationFrame(() => {
+            const nextViewer = document.getElementById("chat-viewer");
+            if (nextViewer) {
+                nextViewer.scrollTop = previousScrollTop;
+            }
+        });
+    }, 95);
+}
+
 async function toggleVirtualFragmentBookmark(tabId, fragmentIndex, event) {
     event?.preventDefault?.();
     event?.stopPropagation?.();
@@ -5897,7 +6212,7 @@ function buildRecentFiltersMarkup() {
                     </div>
                     <div class="extract-history-tools">
                         <button class="extract-history-btn" type="button" onclick="applySavedFilterToDirectory('${serializedFilters}')">開く</button>
-                        <button class="extract-history-btn extract-history-icon-btn" type="button" title="編集" aria-label="編集" onclick="reuseSavedFilter('${serializedFilters}')">✎</button>
+                        <button class="extract-history-btn extract-history-icon-btn circle-pill circle-pill-md" type="button" title="編集" aria-label="編集" onclick="reuseSavedFilter('${serializedFilters}')">✎</button>
                         ${buildBookmarkToggleButtonHtml(
                             starTargetSpec,
                             Boolean(matchingStarredFilter),
@@ -5933,7 +6248,7 @@ function buildStarredFiltersMarkup() {
                     </div>
                     <div class="extract-history-tools">
                         <button class="extract-history-btn" type="button" onclick="applyStoredFilterToDirectory('${serializedFilters}')">開く</button>
-                        <button class="extract-history-btn extract-history-icon-btn" type="button" title="編集" aria-label="編集" onclick="loadStoredFilterIntoExtractPanel('${serializedFilters}')">✎</button>
+                        <button class="extract-history-btn extract-history-icon-btn circle-pill circle-pill-md" type="button" title="編集" aria-label="編集" onclick="loadStoredFilterIntoExtractPanel('${serializedFilters}')">✎</button>
                         <button class="extract-history-btn" type="button" onclick="deleteStarredFilterById(${Number.isNaN(safeId) ? 0 : safeId})">Delete</button>
                     </div>
                 </div>
@@ -6697,6 +7012,13 @@ function jumpToMessage(convIdx, msgIdx, scrollBehavior = "smooth") {
     if (!isSidebarHidden) {
         syncSidebarActiveState({ convIdx, msgIdx }, { scroll: true, behavior: "auto" });
     }
+    const conv = chatData[convIdx];
+    if (conv?.id) {
+        setMessageCollapsed(conv, getTurnStartMessageIndex(conv, msgIdx), false);
+        if (conv.messages?.[msgIdx]?.role !== "user") {
+            setAnswerCollapseOverride(conv, msgIdx, null);
+        }
+    }
     const renderPromise = shouldRenderConversation ? renderChat(convIdx) : Promise.resolve();
 
     renderPromise.then(() => {
@@ -6917,11 +7239,13 @@ async function renderChat(convIdx, options = {}) {
         const turnMatched = turnMatchesQuery(conv, startIndex);
         const turnClasses = [
             "chat-turn",
+            conv.messages[startIndex]?.role === "user" && isMessageCollapsed(conv, startIndex) ? "collapsed-answer" : "",
             turnMatched ? "has-match" : "no-match",
             !turnMatched && isMatchFilterActive ? "filtered-out" : "",
         ]
             .filter(Boolean)
             .join(" ");
+        const isTurnCollapsed = conv.messages[startIndex]?.role === "user" && isMessageCollapsed(conv, startIndex);
         html += `<div class="${turnClasses}" id="turn-${convIdx}-${startIndex}">`;
         if (conv.messages[i] && conv.messages[i].role === "user") {
             promptCount += 1;
@@ -6932,21 +7256,31 @@ async function renderChat(convIdx, options = {}) {
                 prompt.text || ""
             );
             const promptBookmarkState = getCachedBookmarkState(promptBookmarkTarget);
+            const isPromptCollapsed = isMessageCollapsed(conv, i);
             html += `
-                <div class="chat-row user" id="msg-${convIdx}-${i}">
-                    <div class="avatar user-icon"></div>
+                <div class="chat-row user ${isPromptCollapsed ? "is-collapsed" : ""}" id="msg-${convIdx}-${i}">
+                    ${buildMessageAvatarButtonHtml(convIdx, i, "user")}
                     <div class="bubble-wrapper">
                         <div class="prompt-meta-row">
                             <div class="prompt-counter">Prompt ${promptCount}/${Math.max(1, totalPromptCount)}</div>
-                        </div>
-                        <div class="bubble">
                             ${buildPromptBookmarkButtonHtml(
                                 promptBookmarkTarget,
                                 Boolean(promptBookmarkState?.bookmarked),
                                 `togglePromptBookmark(${convIdx}, ${i}, event)`,
-                                "prompt-bubble-bookmark"
+                                "prompt-meta-bookmark"
                             )}
-                            ${renderContent(prompt.text || "")}
+                        </div>
+                        <div class="bubble${isPromptCollapsed ? " bubble-collapsed-preview" : ""}">
+                            <div class="prompt-bubble-layout">
+                                <div class="prompt-bubble-content">
+                                    ${
+                                        isPromptCollapsed
+                                            ? escapeHTML(buildCollapsedMessagePreview(prompt.text || ""))
+                                            : renderPromptContent(prompt.text || "")
+                                    }
+                                </div>
+                                ${buildPromptCopyButtonHtml(convIdx, i)}
+                            </div>
                         </div>
                     </div>
                 </div>`;
@@ -6956,11 +7290,16 @@ async function renderChat(convIdx, options = {}) {
         html += `<div class="answers-container-wrapper"><div class="answers-container">`;
         while (i < conv.messages.length && conv.messages[i].role !== "user") {
             const answer = conv.messages[i];
+            const isAnswerCollapsed = isAnswerMessageCollapsed(conv, i);
             html += `
-                <div class="chat-row assist" id="msg-${convIdx}-${i}">
-                    <div class="avatar assist-icon"></div>
+                <div class="chat-row assist ${isAnswerCollapsed ? "is-collapsed" : ""}" id="msg-${convIdx}-${i}">
+                    ${buildMessageAvatarButtonHtml(convIdx, i, "assist")}
                     <div class="bubble-wrapper">
-                        <div class="bubble">${renderContent(answer.text)}</div>
+                        <div class="bubble${isAnswerCollapsed ? " bubble-collapsed-preview" : ""}">${
+                            isAnswerCollapsed
+                                ? escapeHTML(buildCollapsedMessagePreview(answer.text))
+                                : renderContent(answer.text)
+                        }</div>
                     </div>
                 </div>`;
             i += 1;
@@ -6985,7 +7324,8 @@ async function renderChat(convIdx, options = {}) {
         }
     }
     isolateRenderedMath(viewer);
-    enhanceCodeBlocks(viewer);
+    enhanceCodeBlocks(viewer, { skipUserBubbles: true });
+    refreshScrollFadeStates(viewer);
     playPendingTabReorderAnimation();
     document.querySelectorAll(".chat-row.user").forEach((el) => scrollObserver.observe(el));
     syncPromptNavigatorPopover(false);
@@ -7451,6 +7791,17 @@ function copyCodeBlock(button, codeElement) {
         });
 }
 
+function toggleCodeBlockCollapsed(button, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const wrapper = button?.closest(".code-block-wrapper");
+    if (!wrapper) return;
+    const nextCollapsed = !wrapper.classList.contains("is-collapsed");
+    wrapper.classList.toggle("is-collapsed", nextCollapsed);
+    button.setAttribute("aria-pressed", nextCollapsed ? "true" : "false");
+    button.setAttribute("title", nextCollapsed ? "コードを展開" : "コードを折りたたむ");
+}
+
 function updateCodeBlockStickyOffset(viewer = document.getElementById("chat-viewer")) {
     if (!viewer) return;
 
@@ -7462,24 +7813,123 @@ function updateCodeBlockStickyOffset(viewer = document.getElementById("chat-view
         6;
 
     viewer.style.setProperty("--code-block-sticky-top", `${stickyTop}px`);
+    viewer.style.setProperty("--bubble-action-sticky-top", `${stickyTop}px`);
 }
 
-function enhanceCodeBlocks(root) {
+function inferCodeHighlightLanguage(codeText = "", className = "") {
+    const explicit = String(className || "").match(/language-([a-z0-9_+-]+)/i);
+    if (explicit?.[1]) {
+        return explicit[1].toLowerCase();
+    }
+    const sample = String(codeText || "");
+    if (/^\s*[\[{]/.test(sample) && /"\w+"\s*:/.test(sample)) return "json";
+    if (/\b(?:const|let|var|function|=>|import |export |await |async )\b/.test(sample)) return "javascript";
+    if (/^\s*(def |class |import |from |print\()/m.test(sample)) return "python";
+    if (/^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH|FROM|WHERE|JOIN)\b/im.test(sample)) return "sql";
+    if (
+        /^\s*(curl|git|npm|pnpm|yarn|python|node|bash|sh)\b/im.test(sample) ||
+        /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/.test(sample)
+    ) {
+        return "bash";
+    }
+    return "generic";
+}
+
+function classifyHighlightedCodeToken(token, language, match) {
+    if (language === "json" && match?.[1]) {
+        return match[2] ? "key" : "string";
+    }
+    if (/^(?:\/\*[\s\S]*\*\/|\/\/[^\n]*|#[^\n]*|--[^\n]*)$/.test(token)) return "comment";
+    if (/^"(?:\\.|[^"\\])*"$|^'(?:\\.|[^'\\])*'$|^`[\s\S]*`$/.test(token)) return "string";
+    if (/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(token)) return "variable";
+    if (/^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(token)) return "number";
+    if (/^(?:true|false|null|undefined|None|True|False|NULL)$/i.test(token)) return "literal";
+    if (
+        /^(?:const|let|var|function|return|if|else|for|while|switch|case|break|continue|try|catch|finally|class|extends|new|import|export|from|default|async|await|throw|typeof|instanceof|in|of|def|lambda|yield|raise|pass|with|SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|GROUP|ORDER|BY|HAVING|LIMIT|AND|OR|NOT|AS|ON|VALUES|SET)$/i.test(token)
+    ) {
+        return "keyword";
+    }
+    return "";
+}
+
+function buildCodeHighlightPattern(language) {
+    if (language === "json") {
+        return /("(?:\\.|[^"\\])*")(\s*:)?|\/\*[\s\S]*?\*\/|\/\/[^\n]*|\b(?:true|false|null)\b|-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gm;
+    }
+    if (language === "python") {
+        return /#[^\n]*|"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:def|class|return|if|elif|else|for|while|try|except|finally|import|from|as|with|pass|break|continue|yield|lambda|async|await|raise|in|is|and|or|not|True|False|None)\b|-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gm;
+    }
+    if (language === "sql") {
+        return /\/\*[\s\S]*?\*\/|--[^\n]*|"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|GROUP|ORDER|BY|HAVING|LIMIT|AND|OR|NOT|AS|ON|VALUES|SET|INTO)\b|-?\d+(?:\.\d+)?/gim;
+    }
+    if (language === "bash") {
+        return /#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\b(?:if|then|else|fi|for|do|done|case|esac|function|export|local|return|in)\b|-?\d+(?:\.\d+)?/gm;
+    }
+    return /\/\*[\s\S]*?\*\/|\/\/[^\n]*|#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`[\s\S]*?`|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\b(?:const|let|var|function|return|if|else|for|while|switch|case|break|continue|try|catch|finally|class|extends|new|import|export|from|default|async|await|throw|typeof|instanceof|in|of|def|lambda|yield|raise|pass|with|SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH|FROM|WHERE|JOIN|AND|OR|NOT|true|false|null|undefined|None|True|False)\b|-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gm;
+}
+
+function highlightCodeSyntax(codeText = "", language = "generic") {
+    const source = String(codeText || "");
+    const pattern = buildCodeHighlightPattern(language);
+    let html = "";
+    let cursor = 0;
+
+    for (const match of source.matchAll(pattern)) {
+        const token = match[0];
+        const index = Number(match.index || 0);
+        html += escapeHTML(source.slice(cursor, index));
+        const tokenClass = classifyHighlightedCodeToken(token, language, match);
+        if (tokenClass) {
+            html += `<span class="code-token code-token-${tokenClass}">${escapeHTML(token)}</span>`;
+        } else {
+            html += escapeHTML(token);
+        }
+        cursor = index + token.length;
+    }
+
+    html += escapeHTML(source.slice(cursor));
+    return html;
+}
+
+function enhanceCodeBlocks(root, options = {}) {
     if (!root) return;
+    const skipUserBubbles = options.skipUserBubbles === true;
     root.querySelectorAll("pre > code").forEach((codeElement) => {
         const pre = codeElement.parentElement;
         if (!pre || pre.dataset.codeCopyEnhanced === "true") return;
+        if (skipUserBubbles && codeElement.closest(".chat-row.user .bubble")) return;
 
         pre.dataset.codeCopyEnhanced = "true";
+        const rawCodeText = codeElement.textContent || "";
+        const language = inferCodeHighlightLanguage(rawCodeText, codeElement.className || "");
+        codeElement.dataset.codeLanguage = language;
+        codeElement.innerHTML = highlightCodeSyntax(rawCodeText, language);
         const wrapper = document.createElement("div");
         wrapper.className = "code-block-wrapper";
 
         const toolbar = document.createElement("div");
         toolbar.className = "code-block-toolbar";
 
+        const label = document.createElement("span");
+        label.className = "code-block-label";
+        label.textContent = "<code>";
+
+        const actions = document.createElement("div");
+        actions.className = "code-block-actions";
+
+        const toggleButton = document.createElement("button");
+        toggleButton.type = "button";
+        toggleButton.className = "code-collapse-button raw-debug-panel-btn circle-pill circle-pill-sm";
+        toggleButton.innerHTML = '<span class="code-collapse-button-icon" aria-hidden="true">▾</span>';
+        toggleButton.title = "コードを折りたたむ";
+        toggleButton.setAttribute("aria-pressed", "false");
+        toggleButton.addEventListener("click", (event) => {
+            toggleCodeBlockCollapsed(toggleButton, event);
+        });
+
         const button = document.createElement("button");
         button.type = "button";
-        button.className = "code-copy-button raw-debug-panel-btn";
+        button.className = "code-copy-button raw-debug-panel-btn circle-pill circle-pill-sm";
         button.title = "コードをコピー";
         setCodeCopyButtonState(button, false);
         button.addEventListener("click", (event) => {
@@ -7487,11 +7937,22 @@ function enhanceCodeBlocks(root) {
             event.stopPropagation();
             copyCodeBlock(button, codeElement);
         });
-        toolbar.appendChild(button);
+        actions.appendChild(toggleButton);
+        toolbar.appendChild(label);
+        toolbar.appendChild(actions);
+
+        const body = document.createElement("div");
+        body.className = "code-block-body";
+
+        const copyTrack = document.createElement("div");
+        copyTrack.className = "code-copy-track";
+        copyTrack.appendChild(button);
 
         pre.parentNode.insertBefore(wrapper, pre);
         wrapper.appendChild(toolbar);
-        wrapper.appendChild(pre);
+        wrapper.appendChild(body);
+        body.appendChild(pre);
+        body.appendChild(copyTrack);
 
         const bubble = wrapper.closest(".bubble");
         if (bubble) {
@@ -7505,6 +7966,33 @@ function enhanceCodeBlocks(root) {
     });
 
     updateCodeBlockStickyOffset(root);
+}
+
+function updateScrollFadeState(element) {
+    if (!element) return;
+    const hasOverflow = element.scrollHeight > element.clientHeight + 1;
+    const atEnd = element.scrollTop + element.clientHeight >= element.scrollHeight - 1;
+    element.classList.toggle("has-scroll-fade", hasOverflow && !atEnd);
+}
+
+function bindScrollFade(element) {
+    if (!element || element.dataset.scrollFadeBound === "true") return;
+    element.dataset.scrollFadeBound = "true";
+    element.addEventListener(
+        "scroll",
+        () => {
+            updateScrollFadeState(element);
+        },
+        { passive: true }
+    );
+}
+
+function refreshScrollFadeStates(root = document) {
+    if (!root) return;
+    root.querySelectorAll(".prompt-bubble-content, .code-block-wrapper pre").forEach((element) => {
+        bindScrollFade(element);
+        updateScrollFadeState(element);
+    });
 }
 
 async function executeSearch() {
