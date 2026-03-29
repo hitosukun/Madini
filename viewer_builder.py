@@ -139,13 +139,7 @@ def _build_theme_buttons(themes, scope="inline"):
     )
 
 
-def build_viewer_html(
-    conversations,
-    user_themes=None,
-    system_theme="light",
-    show_toast=False,
-    frameless_host=False,
-):
+def build_viewer_html(conversations, user_themes=None, system_theme="light", show_toast=False):
     themes = merge_themes(user_themes)
     css_text = _read_text(ASSET_DIR / "style.css")
     css_text += "\n" + _read_text(ASSET_DIR / "math.css")
@@ -164,11 +158,7 @@ def build_viewer_html(
     )
 
     boot_options = _escape_json(
-        {
-            "systemTheme": system_theme,
-            "showToast": show_toast,
-            "framelessHost": frameless_host,
-        }
+        {"systemTheme": system_theme, "showToast": show_toast}
     )
 
     return f"""<!DOCTYPE html>
@@ -178,9 +168,9 @@ def build_viewer_html(
 <style>{css_text}</style>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 </head>
-<body class="{'frameless-host' if frameless_host else ''}">
+<body>
 <div id="sidebar">
-    <div class="sidebar-header" onmousedown="maybeStartWindowDrag(event)">
+    <div class="sidebar-header">
         <div class="sidebar-mode-switch" role="tablist" aria-label="左ペインモード">
             <button id="sidebar-mode-threads" class="sidebar-mode-btn active" type="button" role="tab" aria-selected="true" onclick="switchSidebarMode('threads')"><span class="sidebar-mode-btn-icon" aria-hidden="true">📁</span><span>ディレクトリ</span></button>
             <button id="sidebar-mode-extract" class="sidebar-mode-btn" type="button" role="tab" aria-selected="false" onclick="switchSidebarMode('extract')"><span class="sidebar-mode-btn-icon sidebar-mode-btn-icon-filter" aria-hidden="true"></span><span>フィルタ</span></button>

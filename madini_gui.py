@@ -6,7 +6,6 @@ from pathlib import Path
 from PyQt6.QtCore import (
     QEasingCurve,
     QEvent,
-    QPointF,
     QObject,
     QPropertyAnimation,
     QThread,
@@ -17,15 +16,12 @@ from PyQt6.QtCore import (
     pyqtSlot,
 )
 from PyQt6.QtGui import QAction, QDesktopServices, QKeySequence, QPalette
-from PyQt6.QtGui import QPainterPath, QPolygon, QRegion
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QPushButton,
-    QSizePolicy,
     QStatusBar,
     QToolButton,
     QVBoxLayout,
@@ -109,10 +105,9 @@ class CustomWebEnginePage(QWebEnginePage):
 
 
 class ViewerBridge(QObject):
-    def __init__(self, log_callback, window=None):
+    def __init__(self, log_callback):
         super().__init__()
         self.log_callback = log_callback
-        self.window = window
 
     # ViewerBridge is the stable JSON boundary between the WebView and backend store.
     # Phase 2 view-state features should prefer extending this boundary over reaching
@@ -125,14 +120,6 @@ class ViewerBridge(QObject):
     @pyqtSlot(str)
     def copyText(self, text):
         QApplication.clipboard().setText(text)
-
-    @pyqtSlot()
-    def startWindowDrag(self):
-        if not self.window:
-            return
-        handle = self.window.windowHandle()
-        if handle is not None:
-            handle.startSystemMove()
 
     @pyqtSlot(str, result=str)
     def fetchConversation(self, conv_id):
@@ -316,21 +303,11 @@ class MadiniApp(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(1200, 800)
         self.setAcceptDrops(True)
-        if IS_MACOS:
-            self.configure_macos_window_chrome()
 
         main_widget = QWidget()
-        main_widget.setObjectName("rootChromeHost")
         layout = QVBoxLayout(main_widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
         self.setCentralWidget(main_widget)
-
-        self.chrome_bar = None
-        if IS_MACOS:
-            self.chrome_bar = self.build_custom_chrome_bar()
-            self.chrome_bar.setParent(main_widget)
-            self.chrome_bar.raise_()
 
         self.viewer = QWebEngineView()
         self.viewer.setAcceptDrops(False)
@@ -356,7 +333,7 @@ class MadiniApp(QMainWindow):
         )
         self.viewer.setPage(self.page)
         self.viewer.installEventFilter(self)
-        self.bridge = ViewerBridge(self.log_console_append, self)
+        self.bridge = ViewerBridge(self.log_console_append)
         self.channel = QWebChannel(self.page)
         self.channel.registerObject("bridge", self.bridge)
         self.page.setWebChannel(self.channel)
@@ -378,120 +355,6 @@ class MadiniApp(QMainWindow):
         if app_instance is not None:
             app_instance.installEventFilter(self)
         self.load_all_chats_to_viewer()
-
-    def configure_macos_window_chrome(self):
-        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setWindowTitle("")
-
-    def build_custom_chrome_bar(self):
-        bar = QWidget(self)
-        bar.setObjectName("customChromeBar")
-        bar.setFixedSize(82, 22)
-        bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        bar.installEventFilter(self)
-
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-
-        buttons = [
-            ("chromeCloseButton", self.close, "閉じる"),
-            ("chromeMinimizeButton", self.showMinimized, "最小化"),
-            ("chromeZoomButton", self.toggle_zoom_state, "拡大 / 元に戻す"),
-        ]
-        for object_name, callback, tooltip in buttons:
-            button = QPushButton("", bar)
-            button.setObjectName(object_name)
-            button.setFixedSize(12, 12)
-            button.setToolTip(tooltip)
-            button.clicked.connect(callback)
-            layout.addWidget(button)
-
-        bar.setStyleSheet(
-            """
-            QWidget#customChromeBar {
-                background: transparent;
-            }
-            QWidget#rootChromeHost {
-                background: palette(window);
-                border-radius: 12px;
-            }
-            QPushButton#chromeCloseButton,
-            QPushButton#chromeMinimizeButton,
-            QPushButton#chromeZoomButton {
-                border: none;
-                border-radius: 6px;
-                padding: 0;
-                margin: 0;
-            }
-            QPushButton#chromeCloseButton { background: #ff5f57; }
-            QPushButton#chromeMinimizeButton { background: #ffbd2f; }
-            QPushButton#chromeZoomButton { background: #28c840; }
-            QPushButton#chromeCloseButton:hover { background: #ff7b74; }
-            QPushButton#chromeMinimizeButton:hover { background: #ffd45e; }
-            QPushButton#chromeZoomButton:hover { background: #51d96a; }
-            """
-        )
-        return bar
-
-    def toggle_zoom_state(self):
-        if self.isMaximized():
-            self.showNormal()
-        else:
-            self.showMaximized()
-
-    def update_frameless_window_mask(self):
-        if not IS_MACOS:
-            return
-        if self.isMaximized() or self.isFullScreen():
-            self.clearMask()
-            return
-        width = self.width()
-        height = self.height()
-        if width <= 0 or height <= 0:
-            return
-        polygon = self._build_superellipse_polygon(width, height, 16.0, 4.6)
-        if polygon.isEmpty():
-            self.clearMask()
-            return
-        self.setMask(QRegion(polygon))
-
-    def _build_superellipse_polygon(self, width, height, radius, exponent):
-        width = float(width)
-        height = float(height)
-        radius = max(2.0, min(float(radius), width / 2.0, height / 2.0))
-        exponent = max(2.4, float(exponent))
-        path = QPainterPath()
-        path.moveTo(radius, 0.0)
-        path.lineTo(width - radius, 0.0)
-
-        def add_corner(center_x, center_y, start_angle, end_angle):
-            steps = 16
-            for index in range(1, steps + 1):
-                angle = start_angle + (end_angle - start_angle) * (index / steps)
-                x = center_x + radius * self._superellipse_component(angle, exponent)
-                y = center_y + radius * self._superellipse_component(angle - 90.0, exponent)
-                path.lineTo(x, y)
-
-        add_corner(width - radius, radius, -90.0, 0.0)
-        path.lineTo(width, height - radius)
-        add_corner(width - radius, height - radius, 0.0, 90.0)
-        path.lineTo(radius, height)
-        add_corner(radius, height - radius, 90.0, 180.0)
-        path.lineTo(0.0, radius)
-        add_corner(radius, radius, 180.0, 270.0)
-        path.closeSubpath()
-        polygon_f = path.toFillPolygon()
-        return QPolygon([point.toPoint() for point in polygon_f])
-
-    def _superellipse_component(self, angle_degrees, exponent):
-        import math
-
-        radians = math.radians(angle_degrees)
-        cosine = math.cos(radians)
-        magnitude = abs(cosine) ** (2.0 / exponent)
-        return -magnitude if cosine < 0 else magnitude
 
     def log_console_append(self, text):
         lines = [line.strip() for line in str(text).splitlines() if line.strip()]
@@ -776,9 +639,6 @@ class MadiniApp(QMainWindow):
         self.viewer.page().runJavaScript(js)
 
     def eventFilter(self, obj, event):
-        if IS_MACOS and obj in {self.chrome_bar, getattr(self, "viewer", None)}:
-            if self._handle_frameless_drag(obj, event):
-                return True
         if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Meta:
             self.set_command_state(True)
         elif event.type() == QEvent.Type.KeyPress:
@@ -801,35 +661,6 @@ class MadiniApp(QMainWindow):
                 event.accept()
                 return True
         return super().eventFilter(obj, event)
-
-    def _handle_frameless_drag(self, obj, event):
-        if not IS_MACOS or self.isFullScreen():
-            return False
-        if event.type() != QEvent.Type.MouseButtonPress:
-            return False
-        if event.button() != Qt.MouseButton.LeftButton:
-            return False
-
-        position = event.position() if hasattr(event, "position") else QPointF()
-        if obj is self.chrome_bar:
-            if event.target() if hasattr(event, "target") else None:
-                pass
-            if obj.childAt(int(position.x()), int(position.y())) and isinstance(
-                obj.childAt(int(position.x()), int(position.y())), QPushButton
-            ):
-                return False
-            handle = self.windowHandle()
-            if handle is not None:
-                handle.startSystemMove()
-                return True
-            return False
-
-        if obj is getattr(self, "viewer", None) and position.y() <= 18:
-            handle = self.windowHandle()
-            if handle is not None:
-                handle.startSystemMove()
-                return True
-        return False
 
     def _native_shortcut_payload(self, event):
         action_name = self._native_shortcut_action(event)
@@ -914,16 +745,10 @@ class MadiniApp(QMainWindow):
                 "}"
             )
             self.viewer.page().runJavaScript(js)
-        if IS_MACOS and event.type() == event.Type.WindowStateChange:
-            QTimer.singleShot(0, self.update_frameless_window_mask)
         super().changeEvent(event)
 
     def resizeEvent(self, event):
         self.drop_overlay.resize(self.size())
-        if IS_MACOS and self.chrome_bar is not None:
-            self.chrome_bar.move(12, 10)
-            self.chrome_bar.raise_()
-            self.update_frameless_window_mask()
         super().resizeEvent(event)
 
     def dragEnterEvent(self, event):
@@ -963,7 +788,6 @@ class MadiniApp(QMainWindow):
             user_themes=load_themes(),
             system_theme=get_system_theme(self),
             show_toast=show_toast,
-            frameless_host=bool(IS_MACOS and self.chrome_bar is not None),
         )
         TEMP_HTML.write_text(html, encoding="utf-8")
         self.viewer.load(QUrl.fromLocalFile(str(TEMP_HTML.resolve())))

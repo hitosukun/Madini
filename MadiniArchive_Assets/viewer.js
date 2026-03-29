@@ -3092,11 +3092,9 @@ function buildTabStripHtml() {
         })
         .join("");
     return `
-        <div class="tab-strip" onmousedown="maybeStartWindowDrag(event)">
-            <div class="tab-strip-pinned">
-                <div class="tab-strip-pinned-tabs" role="tablist" aria-label="Pinned tabs">
-                    ${pinnedTabsHtml}
-                </div>
+        <div class="tab-strip">
+            <div class="tab-strip-pinned" role="tablist" aria-label="Pinned tabs">
+                ${pinnedTabsHtml}
             </div>
             <div class="tab-strip-scroll-shell">
                 <div class="tab-strip-tabs" role="tablist" aria-label="Open tabs">
@@ -3106,18 +3104,6 @@ function buildTabStripHtml() {
             ${toolbarHtml}
         </div>
     `;
-}
-
-function maybeStartWindowDrag(event) {
-    if (!document.body.classList.contains("frameless-host")) return;
-    if (!event || event.button !== 0) return;
-    const interactiveTarget = event.target?.closest?.(
-        "button, input, textarea, select, summary, a, [role='button'], [role='tab'], .tab-button, .viewer-settings-popover"
-    );
-    if (interactiveTarget) return;
-    if (appBridge && appBridge.startWindowDrag) {
-        appBridge.startWindowDrag();
-    }
 }
 
 function moveTabStripFocus(command) {
