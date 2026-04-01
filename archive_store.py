@@ -1105,6 +1105,7 @@ def _normalize_virtual_thread_filters(filters):
     models = _normalize_filter_values(filters.get("model"))
     roles = _normalize_filter_values(filters.get("role"))
     bookmark_tags = _normalize_filter_values(filters.get("bookmarkTags"))
+    bookmark_tag_groups = _normalize_bookmark_tag_groups(filters.get("bookmarkTagGroups"))
     date_from = str(filters.get("dateFrom") or "").strip()
     date_to = str(filters.get("dateTo") or "").strip()
     title_contains = str(filters.get("titleContains") or "").strip()
@@ -1122,6 +1123,8 @@ def _normalize_virtual_thread_filters(filters):
         normalized["role"] = roles
     if bookmark_tags:
         normalized["bookmarkTags"] = bookmark_tags
+    if bookmark_tag_groups:
+        normalized["bookmarkTagGroups"] = bookmark_tag_groups
     if date_from:
         normalized["dateFrom"] = date_from
     if date_to:
@@ -1148,6 +1151,7 @@ def _has_meaningful_virtual_thread_filters(filters):
             filters.get("model"),
             filters.get("role"),
             filters.get("bookmarkTags"),
+            filters.get("bookmarkTagGroups"),
             filters.get("dateFrom"),
             filters.get("dateTo"),
             filters.get("titleContains"),
@@ -1167,6 +1171,7 @@ def _build_filter_history_label(filters):
     models = filters.get("model") or []
     roles = filters.get("role") or []
     bookmark_tags = filters.get("bookmarkTags") or []
+    bookmark_tag_groups = _normalize_bookmark_tag_groups(filters.get("bookmarkTagGroups"))
     if services:
         parts.append(f"service={'+'.join(services)}")
     if models:
@@ -1182,7 +1187,9 @@ def _build_filter_history_label(filters):
     if roles:
         parts.append(f"role={'+'.join(roles)}")
     if bookmark_tags:
-        parts.append(f"tags={'+'.join(bookmark_tags)}")
+        parts.append(f"tags={'|'.join(bookmark_tags)}")
+    if bookmark_tag_groups:
+        parts.extend([f"tags=({'&'.join(group)})" for group in bookmark_tag_groups])
     if filters.get("sourceFile"):
         parts.append(f"file={filters['sourceFile']}")
     if filters.get("bookmarked") == "bookmarked":
@@ -1203,6 +1210,136 @@ def _build_saved_filter_hash(kind, label, filter_json):
     else:
         seed = filter_json
     return hashlib.md5(seed.encode("utf-8")).hexdigest()
+
+
+def _normalize_bookmark_tag_groups(value):
+    groups = []
+    seen = set()
+    if not isinstance(value, (list, tuple)):
+        return groups
+    for raw_group in value:
+        normalized_group = _normalize_filter_values(raw_group)
+        if len(normalized_group) < 2:
+            continue
+        key = tuple(normalized_group)
+        if key in seen:
+            continue
+        seen.add(key)
+        groups.append(normalized_group)
+    return groups
+
+
+def _combine_bookmark_tag_filter_groups(bookmark_tags, bookmark_tag_groups):
+    combined = []
+    seen = set()
+    for tag in _normalize_filter_values(bookmark_tags):
+        key = (tag,)
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append([tag])
+    for group in _normalize_bookmark_tag_groups(bookmark_tag_groups):
+        key = tuple(group)
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append(group)
+    return combined
+
+
+def _rename_tag_references_in_filters(filters, previous_name, next_name):
+    if not isinstance(filters, dict):
+        return filters, False
+
+    old_name = str(previous_name or "").strip()
+    new_name = str(next_name or "").strip()
+    if not old_name or not new_name or old_name == new_name:
+        return filters, False
+
+    next_filters = dict(filters)
+    changed = False
+
+    bookmark_tags = [
+        new_name if str(tag_name or "").strip() == old_name else str(tag_name or "").strip()
+        for tag_name in _normalize_filter_values(next_filters.get("bookmarkTags"))
+    ]
+    bookmark_tags = list(dict.fromkeys([tag_name for tag_name in bookmark_tags if tag_name]))
+    if bookmark_tags != _normalize_filter_values(next_filters.get("bookmarkTags")):
+        changed = True
+    if bookmark_tags:
+        next_filters["bookmarkTags"] = bookmark_tags
+    else:
+        next_filters.pop("bookmarkTags", None)
+
+    bookmark_tag_groups = []
+    original_groups = _normalize_bookmark_tag_groups(next_filters.get("bookmarkTagGroups"))
+    for group in original_groups:
+        renamed_group = [
+            new_name if str(tag_name or "").strip() == old_name else str(tag_name or "").strip()
+            for tag_name in group
+        ]
+        normalized_group = _normalize_filter_values(renamed_group)
+        if len(normalized_group) >= 2:
+            bookmark_tag_groups.append(normalized_group)
+    bookmark_tag_groups = _normalize_bookmark_tag_groups(bookmark_tag_groups)
+    if bookmark_tag_groups != original_groups:
+        changed = True
+    if bookmark_tag_groups:
+        next_filters["bookmarkTagGroups"] = bookmark_tag_groups
+    else:
+        next_filters.pop("bookmarkTagGroups", None)
+
+    return next_filters, changed
+
+
+def _migrate_saved_filter_tag_references(cursor, previous_name, next_name):
+    if not _table_exists(cursor, "saved_filters"):
+        return 0
+
+    rows = cursor.execute(
+        """
+        SELECT id, kind, label, filter_json
+        FROM saved_filters
+        """
+    ).fetchall()
+
+    updated_count = 0
+    for row in rows:
+        try:
+            filters = json.loads(row["filter_json"]) if row["filter_json"] else {}
+        except (TypeError, json.JSONDecodeError):
+            continue
+
+        next_filters, changed = _rename_tag_references_in_filters(
+            filters,
+            previous_name,
+            next_name,
+        )
+        if not changed:
+            continue
+
+        normalized_filters = _normalize_virtual_thread_filters(next_filters)
+        filter_json = json.dumps(
+            normalized_filters,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        label = row["label"]
+        if row["kind"] == "recent":
+            label = _build_filter_history_label(normalized_filters)
+        filter_hash = _build_saved_filter_hash(row["kind"], label, filter_json)
+
+        cursor.execute(
+            """
+            UPDATE saved_filters
+            SET label = ?, filter_json = ?, filter_hash = ?
+            WHERE id = ?
+            """,
+            (label, filter_json, filter_hash, row["id"]),
+        )
+        updated_count += 1
+
+    return updated_count
 
 
 def _decode_filter_history_row(row):
@@ -2150,6 +2287,99 @@ def create_bookmark_tag(name, db_file=DB_FILE):
     return create_bookmark_label(name, db_file=db_file)
 
 
+def rename_bookmark_label(label_id, name, db_file=DB_FILE):
+    if label_id is None or str(label_id).strip() == "":
+        return {"renamed": 0, "error": "missing_id"}
+    normalized_name = str(name or "").strip()
+    if not normalized_name:
+        return {"renamed": 0, "error": "missing_name"}
+
+    ensure_user_data_dir()
+    if not db_file.exists():
+        return {"renamed": 0, "error": "missing_db"}
+
+    conn = init_db(db_file)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    label_row = cursor.execute(
+        """
+        SELECT id, name, system_key, is_system, created_at, updated_at
+        FROM bookmark_tags
+        WHERE id = ?
+          AND COALESCE(is_system, 0) = 0
+        """,
+        (int(label_id),),
+    ).fetchone()
+    if not label_row:
+        conn.close()
+        return {"renamed": 0, "error": "not_found"}
+
+    duplicate_row = cursor.execute(
+        """
+        SELECT id
+        FROM bookmark_tags
+        WHERE LOWER(name) = LOWER(?)
+          AND id != ?
+        LIMIT 1
+        """,
+        (normalized_name, label_row["id"]),
+    ).fetchone()
+    if duplicate_row:
+        conn.close()
+        return {"renamed": 0, "error": "duplicate"}
+
+    timestamp = _current_timestamp()
+    cursor.execute(
+        """
+        UPDATE bookmark_tags
+        SET name = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (normalized_name, timestamp, label_row["id"]),
+    )
+    migrated_filter_count = _migrate_saved_filter_tag_references(
+        cursor,
+        label_row["name"],
+        normalized_name,
+    )
+    row = cursor.execute(
+        """
+        SELECT
+            t.id,
+            t.name,
+            t.system_key,
+            t.is_system,
+            t.created_at,
+            t.updated_at,
+            COUNT(l.bookmark_id) AS bookmark_count
+        FROM bookmark_tags t
+        LEFT JOIN bookmark_tag_links l ON l.tag_id = t.id
+        WHERE t.id = ?
+        GROUP BY t.id, t.name, t.system_key, t.is_system, t.created_at, t.updated_at
+        """,
+        (label_row["id"],),
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        return {"renamed": 0, "error": "not_found"}
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "systemKey": row["system_key"],
+        "isSystem": bool(row["is_system"]),
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "bookmarkCount": row["bookmark_count"] or 0,
+        "migratedFilterCount": migrated_filter_count,
+        "renamed": 1,
+    }
+
+
+def rename_bookmark_tag(tag_id, name, db_file=DB_FILE):
+    return rename_bookmark_label(tag_id, name, db_file=db_file)
+
+
 def list_bookmark_labels(db_file=DB_FILE, include_system=False):
     ensure_user_data_dir()
     if not db_file.exists():
@@ -2351,6 +2581,7 @@ def _build_virtual_thread_title(filters):
     roles = _normalize_filter_values(filters.get("role"))
     source_file = (filters.get("sourceFile") or "").strip()
     bookmarked = _normalize_bookmarked_filter(filters.get("bookmarked"))
+    bookmark_tag_groups = _normalize_bookmark_tag_groups(filters.get("bookmarkTagGroups"))
 
     if services:
         parts.append(f"service={'+'.join(services)}")
@@ -2368,7 +2599,9 @@ def _build_virtual_thread_title(filters):
     if roles:
         parts.append(f"role={'+'.join(roles)}")
     if bookmark_tags:
-        parts.append(f"tags={'+'.join(bookmark_tags)}")
+        parts.append(f"tags={'|'.join(bookmark_tags)}")
+    if bookmark_tag_groups:
+        parts.extend([f"tags=({'&'.join(group)})" for group in bookmark_tag_groups])
     if source_file:
         parts.append(f"file={source_file}")
     if bookmarked == "bookmarked":
@@ -2384,57 +2617,71 @@ def _build_virtual_thread_title(filters):
 def _build_bookmark_tag_exists_clause(
     target_id_expr,
     bookmark_tags,
+    bookmark_tag_groups=None,
     has_bookmark_tag_tables=True,
 ):
-    normalized_tags = _normalize_filter_values(bookmark_tags)
-    if not normalized_tags:
+    normalized_groups = _combine_bookmark_tag_filter_groups(bookmark_tags, bookmark_tag_groups)
+    if not normalized_groups:
         return "", []
     if not has_bookmark_tag_tables:
         return "1=0", []
-
-    placeholders = ", ".join("?" for _ in normalized_tags)
-    clause = f"""
-        EXISTS (
-            SELECT 1
-            FROM bookmarks b
-            JOIN bookmark_tag_links l ON l.bookmark_id = b.id
-            JOIN bookmark_tags t ON t.id = l.tag_id
-            WHERE b.target_type = 'prompt'
-              AND b.target_id = {target_id_expr}
-              AND LOWER(COALESCE(t.name, '')) IN ({placeholders})
-            GROUP BY b.id
-            HAVING COUNT(DISTINCT LOWER(COALESCE(t.name, ''))) = ?
+    clauses = []
+    params = []
+    for group in normalized_groups:
+        placeholders = ", ".join("?" for _ in group)
+        clauses.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM bookmarks b
+                JOIN bookmark_tag_links l ON l.bookmark_id = b.id
+                JOIN bookmark_tags t ON t.id = l.tag_id
+                WHERE b.target_type = 'prompt'
+                  AND b.target_id = {target_id_expr}
+                  AND LOWER(COALESCE(t.name, '')) IN ({placeholders})
+                GROUP BY b.id
+                HAVING COUNT(DISTINCT LOWER(COALESCE(t.name, ''))) = ?
+            )
+            """
         )
-    """
-    return clause, [tag.lower() for tag in normalized_tags] + [len(normalized_tags)]
+        params.extend([tag.lower() for tag in group])
+        params.append(len(group))
+    return "(" + " OR ".join(clauses) + ")", params
 
 
 def _build_conversation_bookmark_tag_exists_clause(
     conversation_id_expr,
     bookmark_tags,
+    bookmark_tag_groups=None,
     has_bookmark_tag_tables=True,
 ):
-    normalized_tags = _normalize_filter_values(bookmark_tags)
-    if not normalized_tags:
+    normalized_groups = _combine_bookmark_tag_filter_groups(bookmark_tags, bookmark_tag_groups)
+    if not normalized_groups:
         return "", []
     if not has_bookmark_tag_tables:
         return "1=0", []
-
-    placeholders = ", ".join("?" for _ in normalized_tags)
-    clause = f"""
-        EXISTS (
-            SELECT 1
-            FROM bookmarks b
-            JOIN bookmark_tag_links l ON l.bookmark_id = b.id
-            JOIN bookmark_tags t ON t.id = l.tag_id
-            WHERE b.target_type = 'prompt'
-              AND substr(b.target_id, 1, length({conversation_id_expr}) + 1) = {conversation_id_expr} || ':'
-              AND LOWER(COALESCE(t.name, '')) IN ({placeholders})
-            GROUP BY b.id
-            HAVING COUNT(DISTINCT LOWER(COALESCE(t.name, ''))) = ?
+    clauses = []
+    params = []
+    for group in normalized_groups:
+        placeholders = ", ".join("?" for _ in group)
+        clauses.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM bookmarks b
+                JOIN bookmark_tag_links l ON l.bookmark_id = b.id
+                JOIN bookmark_tags t ON t.id = l.tag_id
+                WHERE b.target_type = 'prompt'
+                  AND substr(b.target_id, 1, length({conversation_id_expr}) + 1) = {conversation_id_expr} || ':'
+                  AND LOWER(COALESCE(t.name, '')) IN ({placeholders})
+                GROUP BY b.id
+                HAVING COUNT(DISTINCT LOWER(COALESCE(t.name, ''))) = ?
+            )
+            """
         )
-    """
-    return clause, [tag.lower() for tag in normalized_tags] + [len(normalized_tags)]
+        params.extend([tag.lower() for tag in group])
+        params.append(len(group))
+    return "(" + " OR ".join(clauses) + ")", params
 
 
 def _build_virtual_thread_where(
@@ -2453,6 +2700,7 @@ def _build_virtual_thread_where(
     source_file = (filters.get("sourceFile") or "").strip()
     roles = _normalize_filter_values(filters.get("role"))
     bookmark_tags = _normalize_filter_values(filters.get("bookmarkTags"))
+    bookmark_tag_groups = _normalize_bookmark_tag_groups(filters.get("bookmarkTagGroups"))
     date_from = (filters.get("dateFrom") or "").strip()
     date_to = (filters.get("dateTo") or "").strip()
     title_contains = (filters.get("titleContains") or "").strip()
@@ -2535,10 +2783,11 @@ def _build_virtual_thread_where(
             """
         )
 
-    if bookmark_tags:
+    if bookmark_tags or bookmark_tag_groups:
         clause, clause_params = _build_bookmark_tag_exists_clause(
             "conv_id || ':' || CAST(message_index AS TEXT)",
             bookmark_tags,
+            bookmark_tag_groups,
             has_bookmark_tag_tables=has_bookmarks_table and has_bookmark_tag_tables,
         )
         clauses.append(clause)
@@ -2564,6 +2813,7 @@ def _build_virtual_thread_conversation_where(
     models = _normalize_filter_values(filters.get("model"))
     source_file = (filters.get("sourceFile") or "").strip()
     bookmark_tags = _normalize_filter_values(filters.get("bookmarkTags"))
+    bookmark_tag_groups = _normalize_bookmark_tag_groups(filters.get("bookmarkTagGroups"))
     date_from = (filters.get("dateFrom") or "").strip()
     date_to = (filters.get("dateTo") or "").strip()
     title_contains = (filters.get("titleContains") or "").strip()
@@ -2633,10 +2883,11 @@ def _build_virtual_thread_conversation_where(
             """
         )
 
-    if bookmark_tags:
+    if bookmark_tags or bookmark_tag_groups:
         clause, clause_params = _build_conversation_bookmark_tag_exists_clause(
             f"{table_alias}.id",
             bookmark_tags,
+            bookmark_tag_groups,
             has_bookmark_tag_tables=has_bookmarks_table and has_bookmark_tag_tables,
         )
         clauses.append(clause)

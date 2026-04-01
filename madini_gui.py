@@ -64,6 +64,7 @@ from archive_store import (
     fetch_conversation_index,
     init_db,
     load_themes,
+    rename_bookmark_tag,
     save_recent_filter,
     save_saved_view,
     save_starred_filter,
@@ -112,6 +113,14 @@ class ViewerBridge(QObject):
         super().__init__()
         self.log_callback = log_callback
 
+    def _safe_json(self, producer, fallback):
+        try:
+            result = producer()
+        except Exception as exc:
+            print(f"⚠️ ViewerBridge error: {exc}")
+            return json.dumps(fallback, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)
+
     # ViewerBridge is the stable JSON boundary between the WebView and backend store.
     # Phase 2 view-state features should prefer extending this boundary over reaching
     # directly into storage concerns from the viewer.
@@ -126,38 +135,35 @@ class ViewerBridge(QObject):
 
     @pyqtSlot(str, result=str)
     def fetchConversation(self, conv_id):
-        detail = fetch_conversation_detail(conv_id)
-        return json.dumps(detail, ensure_ascii=False) if detail else ""
+        return self._safe_json(lambda: fetch_conversation_detail(conv_id) or "", "")
 
     @pyqtSlot(str, result=str)
     def fetchConversationRawSource(self, conv_id):
-        detail = fetch_conversation_raw_source(conv_id)
-        return json.dumps(detail, ensure_ascii=False) if detail else ""
+        return self._safe_json(lambda: fetch_conversation_raw_source(conv_id) or "", "")
 
     @pyqtSlot(str, result=str)
     def fetchConversationRawText(self, conv_id):
-        detail = fetch_conversation_raw_text(conv_id)
-        return json.dumps(detail, ensure_ascii=False) if detail else ""
+        return self._safe_json(lambda: fetch_conversation_raw_text(conv_id) or "", "")
 
     @pyqtSlot(result=str)
     def fetchFilterOptions(self):
-        return json.dumps(fetch_filter_options(), ensure_ascii=False)
+        return self._safe_json(fetch_filter_options, {})
 
     @pyqtSlot(result=str)
     def fetchRecentFilters(self):
-        return json.dumps(list_saved_filters(), ensure_ascii=False)
+        return self._safe_json(list_saved_filters, [])
 
     @pyqtSlot(result=str)
     def fetchSavedViews(self):
-        return json.dumps(list_saved_views(), ensure_ascii=False)
+        return self._safe_json(list_saved_views, [])
 
     @pyqtSlot(result=str)
     def fetchStarredFilters(self):
-        return json.dumps(list_starred_filters(), ensure_ascii=False)
+        return self._safe_json(list_starred_filters, [])
 
     @pyqtSlot(result=str)
     def fetchStarredPrompts(self):
-        return json.dumps(list_starred_prompts(), ensure_ascii=False)
+        return self._safe_json(list_starred_prompts, [])
 
     @pyqtSlot(str, result=str)
     def saveRecentFilter(self, payload):
@@ -165,8 +171,7 @@ class ViewerBridge(QObject):
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
-        saved = save_recent_filter(params)
-        return json.dumps(saved or {}, ensure_ascii=False)
+        return self._safe_json(lambda: save_recent_filter(params) or {}, {})
 
     @pyqtSlot(str, result=str)
     def saveSavedView(self, payload):
@@ -174,13 +179,15 @@ class ViewerBridge(QObject):
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
-        saved = save_saved_view(
-            params.get("name"),
-            params.get("filters"),
-            target_type=params.get("targetType") or "virtual_thread",
-            saved_view_id=params.get("id"),
+        return self._safe_json(
+            lambda: save_saved_view(
+                params.get("name"),
+                params.get("filters"),
+                target_type=params.get("targetType") or "virtual_thread",
+                saved_view_id=params.get("id"),
+            ) or {},
+            {},
         )
-        return json.dumps(saved or {}, ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
     def saveStarredFilter(self, payload):
@@ -188,13 +195,15 @@ class ViewerBridge(QObject):
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
-        saved = save_starred_filter(
-            params.get("name"),
-            params.get("filters"),
-            target_type=params.get("targetType") or "virtual_thread",
-            starred_filter_id=params.get("id"),
+        return self._safe_json(
+            lambda: save_starred_filter(
+                params.get("name"),
+                params.get("filters"),
+                target_type=params.get("targetType") or "virtual_thread",
+                starred_filter_id=params.get("id"),
+            ) or {},
+            {},
         )
-        return json.dumps(saved or {}, ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
     def deleteSavedView(self, payload):
@@ -202,11 +211,13 @@ class ViewerBridge(QObject):
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
-        deleted = delete_saved_view(
-            params.get("id"),
-            target_type=params.get("targetType") or "virtual_thread",
+        return self._safe_json(
+            lambda: delete_saved_view(
+                params.get("id"),
+                target_type=params.get("targetType") or "virtual_thread",
+            ),
+            {"deleted": False},
         )
-        return json.dumps(deleted, ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
     def deleteStarredFilter(self, payload):
@@ -214,11 +225,13 @@ class ViewerBridge(QObject):
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
-        deleted = delete_starred_filter(
-            params.get("id"),
-            target_type=params.get("targetType") or "virtual_thread",
+        return self._safe_json(
+            lambda: delete_starred_filter(
+                params.get("id"),
+                target_type=params.get("targetType") or "virtual_thread",
+            ),
+            {"deleted": False},
         )
-        return json.dumps(deleted, ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
     def setBookmark(self, payload):
@@ -228,13 +241,15 @@ class ViewerBridge(QObject):
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
-        result = set_bookmark(
-            params.get("targetType"),
-            params.get("targetId"),
-            params.get("bookmarked"),
-            payload=params.get("payload"),
+        return self._safe_json(
+            lambda: set_bookmark(
+                params.get("targetType"),
+                params.get("targetId"),
+                params.get("bookmarked"),
+                payload=params.get("payload"),
+            ),
+            {},
         )
-        return json.dumps(result, ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
     def fetchBookmarkStates(self, payload):
@@ -244,12 +259,11 @@ class ViewerBridge(QObject):
             params = []
         if not isinstance(params, list):
             params = []
-        result = fetch_bookmark_states(params)
-        return json.dumps(result, ensure_ascii=False)
+        return self._safe_json(lambda: fetch_bookmark_states(params), [])
 
     @pyqtSlot(result=str)
     def fetchBookmarkTags(self):
-        return json.dumps(list_bookmark_tags(), ensure_ascii=False)
+        return self._safe_json(list_bookmark_tags, [])
 
     @pyqtSlot(str, result=str)
     def createBookmarkTag(self, payload):
@@ -257,8 +271,15 @@ class ViewerBridge(QObject):
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
-        result = create_bookmark_tag(params.get("name"))
-        return json.dumps(result or {}, ensure_ascii=False)
+        return self._safe_json(lambda: create_bookmark_tag(params.get("name")) or {}, {})
+
+    @pyqtSlot(str, result=str)
+    def renameBookmarkTag(self, payload):
+        try:
+            params = json.loads(payload)
+        except json.JSONDecodeError:
+            params = {}
+        return self._safe_json(lambda: rename_bookmark_tag(params.get("tagId"), params.get("name")) or {}, {})
 
     @pyqtSlot(str, result=str)
     def setBookmarkTagMembership(self, payload):
@@ -266,12 +287,14 @@ class ViewerBridge(QObject):
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
-        result = set_bookmark_tag_membership(
-            params.get("tagId"),
-            params.get("targets"),
-            params.get("assigned"),
+        return self._safe_json(
+            lambda: set_bookmark_tag_membership(
+                params.get("tagId"),
+                params.get("targets"),
+                params.get("assigned"),
+            ) or {},
+            {},
         )
-        return json.dumps(result or {}, ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
     def deleteBookmarkTag(self, payload):
@@ -279,8 +302,7 @@ class ViewerBridge(QObject):
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
-        result = delete_bookmark_tag(params.get("tagId"))
-        return json.dumps(result or {}, ensure_ascii=False)
+        return self._safe_json(lambda: delete_bookmark_tag(params.get("tagId")) or {}, {})
 
     @pyqtSlot(str, result=str)
     def searchConversations(self, payload):
@@ -289,8 +311,7 @@ class ViewerBridge(QObject):
         except json.JSONDecodeError:
             search_spec = {}
 
-        results = search_conversations_for_spec(search_spec)
-        return json.dumps(results, ensure_ascii=False)
+        return self._safe_json(lambda: search_conversations_for_spec(search_spec), [])
 
     @pyqtSlot(str, result=str)
     def buildVirtualThread(self, payload):
@@ -298,7 +319,7 @@ class ViewerBridge(QObject):
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
-        return json.dumps(build_virtual_thread(params), ensure_ascii=False)
+        return self._safe_json(lambda: build_virtual_thread(params), {})
 
     @pyqtSlot(str, result=str)
     def buildVirtualThreadPreview(self, payload):
@@ -306,7 +327,7 @@ class ViewerBridge(QObject):
             params = json.loads(payload)
         except json.JSONDecodeError:
             params = {}
-        return json.dumps(build_virtual_thread_preview(params), ensure_ascii=False)
+        return self._safe_json(lambda: build_virtual_thread_preview(params), {})
 
     @pyqtSlot(str)
     def log(self, message):
@@ -335,6 +356,15 @@ class MadiniApp(QMainWindow):
         self.status_bar_visible = False
 
         self.setWindowTitle(APP_NAME)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.setMinimumSize(960, 640)
         self.resize(1200, 800)
         self.setAcceptDrops(True)
 

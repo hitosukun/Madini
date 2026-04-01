@@ -190,7 +190,7 @@ window.MathJax = {
 <div id="sidebar">
     <div class="sidebar-header">
         <div class="sidebar-mode-switch" role="tablist" aria-label="左ペインモード">
-            <button id="sidebar-mode-threads" class="sidebar-mode-btn active" type="button" role="tab" aria-selected="true" onclick="switchSidebarMode('threads')"><span class="sidebar-mode-btn-icon" aria-hidden="true">📁</span><span>ディレクトリ</span></button>
+            <button id="sidebar-mode-threads" class="sidebar-mode-btn active" type="button" role="tab" aria-selected="true" data-sidebar-drop-kind="directory-mode" onclick="switchSidebarMode('threads')"><span class="sidebar-mode-btn-icon" aria-hidden="true">📁</span><span>ディレクトリ</span></button>
             <button id="sidebar-mode-extract" class="sidebar-mode-btn" type="button" role="tab" aria-selected="false" onclick="switchSidebarMode('extract')"><span class="sidebar-mode-btn-icon sidebar-mode-btn-icon-filter" aria-hidden="true"></span><span>フィルタ</span></button>
         </div>
         <div id="thread-list-panel" class="sidebar-panel active">
@@ -223,7 +223,12 @@ window.MathJax = {
         </div>
         <div id="extract-panel" class="sidebar-panel">
             <div class="extract-form">
-                <div class="extract-summary extract-summary-top" title="Preview count and date-based sort use the same primary time rule.">
+                <div
+                    id="extract-summary-dropzone"
+                    class="extract-summary extract-summary-top"
+                    data-extract-drop-kind="extract-summary"
+                    title="Preview count and date-based sort use the same primary time rule."
+                >
                     <div class="extract-summary-head">
                         <div class="extract-summary-copy">
                             <div class="extract-hit-count" title="Primary time: source_created_at, then imported_at, then date_str."><span id="extract-hit-count">0</span> 件</div>
@@ -241,6 +246,7 @@ window.MathJax = {
                         <span>Tag</span>
                         <input type="hidden" id="extract-bookmarked" value="all">
                         <input type="hidden" id="extract-bookmark-tags" value="[]">
+                        <input type="hidden" id="extract-bookmark-tag-groups" value="[]">
                         <div id="extract-bookmark-tags-picker" class="extract-model-picker">
                             <button id="extract-bookmark-tags-trigger" class="extract-picker-trigger" type="button" onclick="toggleExtractBookmarkTagMenu(event)">
                                 <span id="extract-bookmark-tags-trigger-label">タグを選ぶ</span>
@@ -297,15 +303,6 @@ window.MathJax = {
                         <datalist id="extract-source-file-options"></datalist>
                     </label>
                 </div>
-                <section class="extract-history-section">
-                    <div class="extract-history-header">
-                        <div class="extract-history-heading">
-                            <h3><span class="tab-button-kind tab-button-kind-icon tab-button-kind-clock extract-history-title-icon" aria-hidden="true"></span><span>履歴</span></h3>
-                            <div class="extract-history-note">直近10件だけをここに表示するよ</div>
-                        </div>
-                    </div>
-                    <div id="extract-history-list" class="extract-history-list"></div>
-                </section>
             </div>
         </div>
     </div>

@@ -5,6 +5,7 @@
     --bubble-font-size: 1rem;
     --tree-font-size: 0.84em;
     --prompt-font-size: 0.78em;
+    --sidebar-width: 292px;
     --focus-ring-color: color-mix(in srgb, var(--accent-color) 72%, white 28%);
     --focus-ring-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-color) 18%, transparent);
 }
@@ -54,6 +55,55 @@ body.command-nav-active .conversation-root-prompt.is-sidebar-hidden {
 }
 
 #sidebar { width: 292px; border-right: 0; display: flex; flex-direction: column; background: color-mix(in srgb, var(--sidebar-bg) 94%, var(--bg-color)); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif; transition: background 0.4s ease; z-index: 100; overflow: hidden; }
+#sidebar { width: var(--sidebar-width); }
+#sidebar {
+    transition: background 0.4s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+}
+#sidebar.is-drag-over {
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
+    background: color-mix(in srgb, var(--accent-color) 6%, var(--sidebar-bg));
+}
+#sidebar.is-drag-over .sidebar-mode-switch {
+    border-color: color-mix(in srgb, var(--accent-color) 34%, var(--border-color));
+    box-shadow:
+        inset 0 1px 0 color-mix(in srgb, white 10%, transparent),
+        inset 0 -1px 0 color-mix(in srgb, black 10%, transparent),
+        0 0 0 1px color-mix(in srgb, var(--accent-color) 16%, transparent);
+}
+#sidebar,
+#sidebar button,
+#sidebar summary,
+#sidebar .tree-summary,
+#sidebar .prompt-item,
+#sidebar .prompt-item-row,
+#sidebar .extract-summary,
+#sidebar .extract-history-item,
+#sidebar .extract-history-prompt-row,
+#sidebar .bookmark-tag-dropzone,
+#sidebar .bookmark-tag-group-card,
+#sidebar .bookmark-workspace-summary-toggle,
+#sidebar .bookmark-workspace-chip,
+#sidebar .bookmark-workspace-list {
+    user-select: none;
+    -webkit-user-select: none;
+}
+#sidebar input,
+#sidebar textarea,
+#sidebar [contenteditable="true"] {
+    user-select: text;
+    -webkit-user-select: text;
+}
+body.bookmark-dragging #sidebar,
+body.bookmark-dragging #sidebar * {
+    user-select: none !important;
+    -webkit-user-select: none !important;
+}
+body.bookmark-dragging #sidebar input,
+body.bookmark-dragging #sidebar textarea,
+body.bookmark-dragging #sidebar [contenteditable="true"] {
+    user-select: text !important;
+    -webkit-user-select: text !important;
+}
 .sidebar-header { position: relative; padding: 10px 12px 10px 12px; border-bottom: 0; color: var(--sidebar-text); background: transparent; display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
 .sidebar-mode-switch {
     display: flex;
@@ -134,6 +184,17 @@ body.command-nav-active .conversation-root-prompt.is-sidebar-hidden {
     border-radius: 1px;
     opacity: 0.82;
 }
+.tab-button-kind-pin {
+    width: 11px;
+    height: 11px;
+    display: inline-block;
+    flex: 0 0 auto;
+    background: currentColor;
+    clip-path: polygon(50% 0, 86% 22%, 68% 42%, 68% 70%, 56% 70%, 56% 100%, 44% 100%, 44% 70%, 32% 70%, 32% 42%, 14% 22%);
+    opacity: 0.86;
+    transform: rotate(24deg);
+    transform-origin: 48% 56%;
+}
 .tab-button-kind-star {
     width: 12px;
     height: 12px;
@@ -201,9 +262,45 @@ body.command-nav-active .conversation-root-prompt.is-sidebar-hidden {
 .sidebar-mode-btn.active .sidebar-mode-btn-icon-filter {
     opacity: 0.96;
 }
+.sidebar-mode-btn.is-drag-over {
+    border-color: color-mix(in srgb, var(--accent-color) 36%, var(--border-color));
+    background: color-mix(in srgb, var(--accent-color) 14%, var(--sidebar-bg));
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-color) 18%, transparent);
+}
 .sidebar-panel { display: none; min-height: 0; }
 .sidebar-panel.active { display: block; flex: 1; min-height: 0; }
 #thread-list-panel.active { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+#thread-list-panel {
+    position: relative;
+    border-radius: 14px;
+    transition: background-color 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease, transform 0.16s ease;
+}
+#thread-list-panel.is-drag-over {
+    background: color-mix(in srgb, var(--accent-color) 7%, transparent);
+    box-shadow:
+        inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 28%, var(--border-color)),
+        0 10px 24px color-mix(in srgb, var(--accent-color) 10%, transparent);
+    transform: translateY(-1px);
+}
+#thread-list-panel.is-drag-over::after {
+    content: attr(data-drop-label);
+    position: absolute;
+    right: 10px;
+    top: 10px;
+    display: inline-flex;
+    align-items: center;
+    min-height: 20px;
+    padding: 0 9px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent-color) 18%, var(--bg-color));
+    border: 1px solid color-mix(in srgb, var(--accent-color) 28%, var(--border-color));
+    color: var(--text-color);
+    font-size: 0.66rem;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    pointer-events: none;
+    z-index: 12;
+}
 #extract-panel.active {
     overflow-y: auto;
     overflow-x: hidden;
@@ -608,6 +705,34 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
     font-size: 0.9rem;
 }
 .extract-summary { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-radius: 12px; background: color-mix(in srgb, var(--bg-color) 66%, var(--sidebar-bg)); border: 1px solid color-mix(in srgb, var(--border-color) 46%, transparent); }
+.extract-summary {
+    position: relative;
+    transition: border-color 0.16s ease, box-shadow 0.16s ease, background-color 0.16s ease, transform 0.16s ease;
+}
+.extract-summary.is-drag-over {
+    border-color: color-mix(in srgb, var(--accent-color) 34%, var(--border-color));
+    background: color-mix(in srgb, var(--accent-color) 8%, var(--bg-color) 66%, var(--sidebar-bg));
+    box-shadow: 0 10px 24px color-mix(in srgb, var(--accent-color) 14%, transparent);
+    transform: translateY(-1px);
+}
+.extract-summary.is-drag-over::after {
+    content: attr(data-drop-label);
+    position: absolute;
+    right: 10px;
+    bottom: 8px;
+    display: inline-flex;
+    align-items: center;
+    min-height: 20px;
+    padding: 0 9px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent-color) 18%, var(--bg-color));
+    border: 1px solid color-mix(in srgb, var(--accent-color) 28%, var(--border-color));
+    color: var(--text-color);
+    font-size: 0.66rem;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    pointer-events: none;
+}
 .extract-summary-top { margin-bottom: 10px; }
 .extract-summary-head {
     display: flex;
@@ -776,6 +901,12 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
         border-color 0.16s ease,
         box-shadow 0.16s ease;
 }
+.extract-history-item-draggable {
+    cursor: grab;
+}
+.extract-history-item-draggable:active {
+    cursor: grabbing;
+}
 .extract-history-item:hover,
 .extract-history-item:focus-within {
     background: color-mix(in srgb, var(--accent-color) 5%, var(--bg-color) 72%, var(--sidebar-bg));
@@ -823,6 +954,7 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
 }
 .extract-history-item:hover > .extract-history-meta .extract-history-tools,
 .extract-history-item:focus-within > .extract-history-meta .extract-history-tools,
+.extract-history-item.is-pinned > .extract-history-meta .extract-history-tools,
 .extract-history-prompt-row:hover .extract-history-tools,
 .extract-history-prompt-row:focus-within .extract-history-tools {
     opacity: 1;
@@ -934,10 +1066,12 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
     justify-content: flex-end;
     gap: 6px;
     width: min(420px, 100%);
+    overflow: visible;
 }
 .bookmark-tag-dropzone {
     appearance: none;
     -webkit-appearance: none;
+    position: relative;
     display: inline-flex;
     align-items: center;
     gap: 7px;
@@ -949,7 +1083,29 @@ body.dark .extract-field input[type="date"]::-webkit-calendar-picker-indicator {
     font: inherit;
     font-size: 0.72rem;
     cursor: pointer;
+    overflow: visible;
     transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease, transform 0.16s ease;
+}
+.bookmark-tag-dropzone.is-editing {
+    cursor: default;
+    border-style: solid;
+}
+.bookmark-tag-dropzone.is-drag-over[data-drop-label]::after {
+    content: attr(data-drop-label);
+    position: absolute;
+    left: 50%;
+    top: calc(100% + 8px);
+    transform: translateX(-50%);
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent-color) 20%, var(--bg-color));
+    color: var(--text-color);
+    font-size: 0.66rem;
+    font-weight: 700;
+    white-space: nowrap;
+    box-shadow: 0 10px 24px color-mix(in srgb, var(--accent-color) 16%, transparent);
+    pointer-events: none;
+    z-index: 3;
 }
 .bookmark-tag-dropzone.is-drag-over,
 body.bookmark-dragging .bookmark-tag-dropzone:hover {
@@ -962,6 +1118,9 @@ body.bookmark-dragging .bookmark-tag-dropzone:hover {
     background: color-mix(in srgb, var(--accent-color) 14%, var(--sidebar-bg));
     border-color: color-mix(in srgb, var(--accent-color) 40%, var(--border-color));
     color: var(--text-color);
+}
+.bookmark-tag-dropzone.is-filter-locked {
+    opacity: 0.72;
 }
 .bookmark-drag-ghost {
     position: fixed;
@@ -991,6 +1150,61 @@ body.bookmark-dragging .bookmark-tag-dropzone:hover {
 .bookmark-tag-dropzone-label {
     font-weight: 650;
 }
+.bookmark-tag-dropzone-edit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 999px;
+    color: color-mix(in srgb, var(--sidebar-text) 62%, transparent);
+    font-size: 0.7rem;
+    line-height: 1;
+    opacity: 0.66;
+    transition: opacity 0.14s ease, color 0.14s ease, background-color 0.14s ease;
+}
+.bookmark-tag-dropzone:hover .bookmark-tag-dropzone-edit,
+.bookmark-tag-dropzone:focus-visible .bookmark-tag-dropzone-edit {
+    opacity: 1;
+    color: var(--text-color);
+    background: color-mix(in srgb, var(--accent-color) 12%, transparent);
+}
+.bookmark-tag-inline-editor {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    flex: 1;
+}
+.bookmark-tag-inline-input {
+    min-width: 0;
+    width: 100%;
+    padding: 4px 8px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
+    background: color-mix(in srgb, var(--bg-color) 95%, var(--sidebar-bg));
+    color: var(--text-color);
+    font: inherit;
+    font-size: 0.72rem;
+}
+.bookmark-tag-inline-action {
+    appearance: none;
+    -webkit-appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--accent-color) 28%, var(--border-color));
+    background: color-mix(in srgb, var(--accent-color) 10%, transparent);
+    color: var(--text-color);
+    font: inherit;
+    font-size: 0.68rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+}
 .bookmark-tag-dropzone-count {
     display: inline-flex;
     align-items: center;
@@ -1002,6 +1216,47 @@ body.bookmark-dragging .bookmark-tag-dropzone:hover {
     background: color-mix(in srgb, var(--accent-color) 12%, transparent);
     color: inherit;
     font-size: 0.68rem;
+}
+.bookmark-tag-group-card {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    background: color-mix(in srgb, var(--accent-color) 7%, var(--sidebar-bg));
+    cursor: pointer;
+}
+.bookmark-tag-group-members {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.bookmark-tag-group-separator {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: color-mix(in srgb, var(--text-color) 76%, transparent);
+    font-size: 0.76rem;
+    font-weight: 800;
+    line-height: 1;
+}
+.bookmark-tag-group-member-chip {
+    cursor: pointer;
+}
+.bookmark-tag-group-card.is-filter-active .bookmark-tag-group-member-chip {
+    background: color-mix(in srgb, var(--accent-color) 18%, var(--sidebar-bg));
+    border-color: color-mix(in srgb, var(--accent-color) 34%, var(--border-color));
+    color: var(--text-color);
+}
+.bookmark-tag-group-member-chip .extract-chip-remove {
+    position: static;
+    opacity: 1;
+    transform: none;
+    width: 14px;
+    height: 14px;
+    background: color-mix(in srgb, var(--bg-color) 94%, var(--accent-color) 6%);
+    border: 1px solid color-mix(in srgb, var(--accent-color) 28%, var(--border-color));
+    box-shadow: 0 2px 6px color-mix(in srgb, black 12%, transparent);
 }
 .bookmark-tag-dropzone-remove-icon {
     display: inline-flex;
@@ -1025,11 +1280,39 @@ body.bookmark-dragging .bookmark-tag-dropzone:hover {
     border: 1px solid color-mix(in srgb, var(--border-color) 58%, transparent);
     background: color-mix(in srgb, var(--sidebar-bg) 72%, var(--bg-color));
 }
+.bookmark-workspace-collapsible {
+    padding-bottom: 12px;
+}
+.bookmark-workspace-group + .bookmark-workspace-group {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid color-mix(in srgb, var(--border-color) 54%, transparent);
+}
+.bookmark-workspace-summary-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    cursor: pointer;
+    list-style: none;
+}
+.bookmark-workspace-summary-toggle::-webkit-details-marker {
+    display: none;
+}
 .bookmark-workspace-title {
     margin: 0 0 8px;
     color: var(--text-color);
     font-size: 0.82rem;
     font-weight: 720;
+}
+.bookmark-workspace-summary-toggle .bookmark-workspace-title {
+    margin: 0;
+}
+.bookmark-workspace-subtitle {
+    margin: 0 0 6px;
+    color: var(--text-color);
+    font-size: 0.76rem;
+    font-weight: 700;
 }
 .bookmark-workspace-summary {
     margin: 0;
@@ -1037,11 +1320,47 @@ body.bookmark-dragging .bookmark-tag-dropzone:hover {
     font-size: 0.76rem;
     line-height: 1.55;
 }
+.bookmark-workspace-caret {
+    width: 10px;
+    height: 10px;
+    border-right: 2px solid color-mix(in srgb, var(--sidebar-text) 78%, transparent);
+    border-bottom: 2px solid color-mix(in srgb, var(--sidebar-text) 78%, transparent);
+    transform: rotate(45deg);
+    transition: transform 0.16s ease;
+    flex: 0 0 auto;
+    margin-right: 2px;
+}
+.bookmark-workspace-collapsible[open] .bookmark-workspace-caret {
+    transform: rotate(225deg);
+    margin-top: 4px;
+}
 .bookmark-workspace-chip-list {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
     margin-top: 10px;
+}
+.bookmark-workspace-filter-list {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+}
+.bookmark-workspace-filter-group {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+.bookmark-workspace-filter-separator {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: color-mix(in srgb, var(--text-color) 76%, transparent);
+    font-size: 0.78rem;
+    font-weight: 800;
+    line-height: 1;
 }
 .bookmark-workspace-chip {
     display: inline-flex;
@@ -1053,8 +1372,12 @@ body.bookmark-dragging .bookmark-tag-dropzone:hover {
     font-size: 0.7rem;
     font-weight: 650;
 }
+.extract-chip-compound {
+    background: color-mix(in srgb, var(--accent-color) 12%, var(--bg-color));
+}
 .bookmark-workspace-list {
     margin: 0;
+    padding-top: 8px;
     padding-left: 18px;
     color: color-mix(in srgb, var(--sidebar-text) 84%, transparent);
     font-size: 0.76rem;
@@ -1252,9 +1575,29 @@ body.bookmark-dragging .bookmark-tag-dropzone:hover {
     flex-shrink: 0;
     position: relative;
     z-index: 110;
+    cursor: col-resize;
 }
 #resizer::before {
-    display: none;
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 2px;
+    width: 2px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--border-color) 72%, transparent);
+    opacity: 0;
+    transition: opacity 0.16s ease, background-color 0.16s ease;
+}
+#resizer:hover::before,
+body.sidebar-resizing #resizer::before {
+    opacity: 1;
+    background: color-mix(in srgb, var(--accent-color) 38%, var(--border-color));
+}
+body.sidebar-resizing {
+    cursor: col-resize;
+    user-select: none;
+    -webkit-user-select: none;
 }
 #index-tree {
     flex: 1;

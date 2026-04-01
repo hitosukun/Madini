@@ -59,6 +59,7 @@ let starredExtractFilters = [];
 let starredPromptEntries = [];
 let savedExtractViews = [];
 let bookmarkTags = [];
+let bookmarkTagGroups = [];
 let bookmarkGroupOpenByKey = {};
 let selectedDirectoryPromptKeys = [];
 let directoryPromptSelectionAnchorKey = "";
@@ -66,6 +67,9 @@ let selectedStarredPromptKeys = [];
 let starredPromptSelectionAnchorKey = "";
 let selectedBookmarkTagFilterIds = [];
 let bookmarkUndoStack = [];
+let editingBookmarkTagId = "";
+let editingBookmarkTagName = "";
+let bookmarkTagRenameSavingId = "";
 let bookmarkSelectionDragState = null;
 let bookmarkSelectionDragGhostEl = null;
 let bookmarkSelectionDragBound = false;
@@ -497,9 +501,14 @@ const STORAGE_KEYS = {
     matchFilter: "novel-archive-match-filter",
     sortMode: "novel-archive-sort-mode",
     sidebarHidden: "novel-archive-sidebar-hidden",
+    sidebarWidth: "novel-archive-sidebar-width",
     sidebarMode: "novel-archive-sidebar-mode",
     tabSession: "novel-archive-tab-session",
+    bookmarkTagGroups: "novel-archive-bookmark-tag-groups",
 };
+
+const SIDEBAR_WIDTH_MIN = 220;
+const SIDEBAR_WIDTH_MAX = 520;
 
 const COMMON_MATH_OPERATOR_NAMES = Object.freeze([
     "Im",
@@ -669,22 +678,26 @@ function normalizeExplicitMathDelimiters(sourceText) {
     return nextText;
 }
 
+function protectStructuredArtifactSegments(sourceText, placeholders) {
+    if (!placeholders) return String(sourceText || "");
+    return String(sourceText || "")
+        .split("\n")
+        .map((line) => {
+            const trimmed = String(line || "").trim();
+            if (!trimmed || !looksLikeStructuredArtifactText(trimmed)) {
+                return line;
+            }
+            return placeholders.put(`<code class="structured-artifact-inline">${escapeHTML(trimmed)}</code>`);
+        })
+        .join("\n");
+}
+
 function protectSafeHtmlSegments(sourceText, placeholders) {
     if (!placeholders) return String(sourceText || "");
     return String(sourceText || "").replace(/<\s*(br|wbr)\s*\/?\s*>/gi, (match) => {
         const normalized = /^<\s*wbr/i.test(match) ? "<wbr>" : "<br>";
         return placeholders.put(normalized);
     });
-}
-
-function protectMarkdownStrongSegments(sourceText, placeholders) {
-    if (!placeholders) return String(sourceText || "");
-    let nextText = String(sourceText || "");
-    const strongPattern = /(\*\*|__)(?=\S)([^\n]*?\S)\1/g;
-    nextText = nextText.replace(strongPattern, (_match, _marker, inner) => {
-        return placeholders.put(`<strong>${inner}</strong>`);
-    });
-    return nextText;
 }
 
 function containsExplicitTeX(sourceText) {
@@ -859,6 +872,7 @@ function normalizeMathSourceArtifacts(sourceText) {
         .map((line) => {
             const rawLine = String(line || "");
             if (!rawLine.trim()) return rawLine;
+            if (looksLikeStructuredArtifactText(rawLine)) return rawLine;
 
             if (containsExplicitTeX(rawLine)) {
                 return rawLine
@@ -887,12 +901,38 @@ function normalizeMathSourceArtifacts(sourceText) {
     return nextText;
 }
 
+function looksLikeStructuredArtifactText(line) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) return false;
+
+    const startsLikeInvocation = /^[A-Za-z_][A-Za-z0-9_.]*\s*\(/.test(trimmed);
+    const hasJsonLikePayload =
+        /[\[{]\s*"[^"]+"\s*:/.test(trimmed)
+        || /[\[{]\s*'[^']+'\s*:/.test(trimmed)
+        || /\b[A-Za-z_][A-Za-z0-9_]*\s*:\s*["'\[{0-9A-Za-z_-]/.test(trimmed);
+    const hasStructuredDelimiters =
+        /[{}[\]]/.test(trimmed)
+        && /[:,]/.test(trimmed)
+        && /["']/.test(trimmed);
+    const looksLikeJsonFragment =
+        hasJsonLikePayload
+        && /[{}[\],]/.test(trimmed);
+
+    return (startsLikeInvocation && (hasJsonLikePayload || hasStructuredDelimiters))
+        || (/^[A-Za-z_][A-Za-z0-9_.]*\s*\{/.test(trimmed) && hasJsonLikePayload)
+        || looksLikeJsonFragment;
+}
+
 function looksLikeMathishText(line) {
     const trimmed = String(line || "").trim();
     if (!trimmed) return false;
     if (/^[-*]\s/.test(trimmed) || /^\d+\.\s/.test(trimmed)) return false;
     if (/^<\s*\/?\s*[A-Za-z][^>]*>$/.test(trimmed)) return false;
+    if (/(?:\*\*|__)/.test(trimmed)) return false;
+    if (/^#{1,6}\s/.test(trimmed)) return false;
     if (/[。、「」『』【】]/.test(trimmed)) return false;
+    if (looksLikeStructuredArtifactText(trimmed)) return false;
+    if (/^[A-Za-z]{2,}[A-Za-z0-9]*(?:_[A-Za-z0-9]{2,})+$/.test(trimmed)) return false;
 
     const mathSignals = [
         /\\[A-Za-z]+/,
@@ -5159,6 +5199,72 @@ function toggleSidebarVisibilityButton() {
     toggleSidebarVisibility(!isSidebarHidden);
 }
 
+function clampSidebarWidth(value) {
+    const numeric = Number.parseInt(value, 10);
+    if (!Number.isFinite(numeric)) return 292;
+    return Math.max(SIDEBAR_WIDTH_MIN, Math.min(SIDEBAR_WIDTH_MAX, numeric));
+}
+
+function applySidebarWidth(width) {
+    const nextWidth = clampSidebarWidth(width);
+    document.documentElement.style.setProperty("--sidebar-width", `${nextWidth}px`);
+    localStorage.setItem(STORAGE_KEYS.sidebarWidth, String(nextWidth));
+}
+
+function ensureSidebarResizer() {
+    const resizer = document.getElementById("resizer");
+    const sidebar = document.getElementById("sidebar");
+    if (!resizer || !sidebar || resizer.dataset.bound === "true") return;
+    resizer.dataset.bound = "true";
+
+    let resizing = false;
+    let activePointerId = null;
+
+    const stopResize = () => {
+        if (!resizing) return;
+        resizing = false;
+        activePointerId = null;
+        document.body.classList.remove("sidebar-resizing");
+    };
+
+    const updateWidth = (clientX) => {
+        if (!resizing || isSidebarHidden) return;
+        const nextWidth = clampSidebarWidth(clientX);
+        document.documentElement.style.setProperty("--sidebar-width", `${nextWidth}px`);
+    };
+
+    resizer.addEventListener("pointerdown", (event) => {
+        if ((event.button ?? 0) !== 0 || isSidebarHidden) return;
+        resizing = true;
+        activePointerId = event.pointerId ?? null;
+        document.body.classList.add("sidebar-resizing");
+        resizer.setPointerCapture?.(event.pointerId);
+        updateWidth(event.clientX ?? sidebar.getBoundingClientRect().width);
+        event.preventDefault();
+    });
+
+    const handlePointerMove = (event) => {
+        if (activePointerId !== null && event.pointerId !== activePointerId) return;
+        updateWidth(event.clientX ?? 0);
+    };
+
+    const handlePointerUp = (event) => {
+        if (activePointerId !== null && event.pointerId !== activePointerId) return;
+        if (resizing) {
+            applySidebarWidth(event.clientX ?? sidebar.getBoundingClientRect().width);
+        }
+        stopResize();
+    };
+
+    resizer.addEventListener("pointermove", handlePointerMove);
+    resizer.addEventListener("pointerup", handlePointerUp);
+    resizer.addEventListener("pointercancel", stopResize);
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", stopResize);
+    window.addEventListener("blur", stopResize);
+}
+
 function applyTheme() {
     if (!currentThemes[activeTheme]) {
         activeTheme = Object.keys(currentThemes)[0] || "default";
@@ -5727,19 +5833,18 @@ function renderContent(text) {
     let sourceText = text || "";
     const codePlaceholders = createHtmlPlaceholderStore("CODE_PLACEHOLDER");
     const htmlPlaceholders = createHtmlPlaceholderStore("HTML_PLACEHOLDER");
-    const markdownPlaceholders = createHtmlPlaceholderStore("MARKDOWN_PLACEHOLDER");
     const mathPlaceholders = createHtmlPlaceholderStore("MATH_PLACEHOLDER");
 
     // Keep code segments opaque so later markdown/math passes cannot corrupt them.
     sourceText = protectCodeSegments(sourceText, codePlaceholders);
     sourceText = decodeSafeHtmlEntities(sourceText);
     sourceText = normalizeExplicitMathDelimiters(sourceText);
+    sourceText = protectStructuredArtifactSegments(sourceText, codePlaceholders);
     sourceText = protectSafeHtmlSegments(sourceText, htmlPlaceholders);
     const hasProtectedMathSyntax = containsProtectedMathSyntax(sourceText);
     // Explicit TeX delimiters are already trustworthy source. Isolate them
     // before shorthand repair so normal math is never rewritten by heuristics.
     sourceText = renderExplicitMathSegments(sourceText, mathPlaceholders);
-    sourceText = protectMarkdownStrongSegments(sourceText, markdownPlaceholders);
     if (!hasProtectedMathSyntax) {
         sourceText = normalizeMathSourceArtifacts(sourceText);
         sourceText = renderMathSegments(sourceText, mathPlaceholders);
@@ -5748,7 +5853,6 @@ function renderContent(text) {
     let html = escapeHTML(sourceText);
     html = applyBasicMarkdown(html);
     html = htmlPlaceholders.restore(html);
-    html = markdownPlaceholders.restore(html);
     html = mathPlaceholders.restore(html);
     return codePlaceholders.restore(html);
 }
@@ -6098,6 +6202,42 @@ function writeExtractMultiValue(id, values) {
     input.value = JSON.stringify(normalized);
 }
 
+function normalizeBookmarkTagNameGroup(group) {
+    return [...new Set((Array.isArray(group) ? group : []).map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+function normalizeBookmarkTagNameGroups(groups) {
+    const normalized = [];
+    const seen = new Set();
+    (Array.isArray(groups) ? groups : []).forEach((group) => {
+        const nextGroup = normalizeBookmarkTagNameGroup(group);
+        if (nextGroup.length < 2) return;
+        const key = nextGroup.join("\u0001");
+        if (seen.has(key)) return;
+        seen.add(key);
+        normalized.push(nextGroup);
+    });
+    return normalized;
+}
+
+function readExtractGroupValue(id) {
+    const input = document.getElementById(id);
+    if (!input) return [];
+    const rawValue = String(input.value || "").trim();
+    if (!rawValue) return [];
+    try {
+        return normalizeBookmarkTagNameGroups(JSON.parse(rawValue));
+    } catch (_error) {
+        return [];
+    }
+}
+
+function writeExtractGroupValue(id, groups) {
+    const input = document.getElementById(id);
+    if (!input) return;
+    input.value = JSON.stringify(normalizeBookmarkTagNameGroups(groups));
+}
+
 function formatExtractServiceLabel(service) {
     if (service === "chatgpt") return "ChatGPT";
     if (service === "claude") return "Claude";
@@ -6115,6 +6255,10 @@ function getSelectedExtractModels() {
 
 function getSelectedExtractBookmarkTags() {
     return readExtractMultiValue("extract-bookmark-tags");
+}
+
+function getSelectedExtractBookmarkTagGroups() {
+    return readExtractGroupValue("extract-bookmark-tag-groups");
 }
 
 function getAvailableExtractModels() {
@@ -6138,6 +6282,144 @@ function getAvailableExtractBookmarkTagEntries() {
     return (bookmarkTags || []).filter((tag) => String(tag?.name || "").trim());
 }
 
+function getBookmarkTagByName(tagName) {
+    const normalizedName = String(tagName || "").trim();
+    if (!normalizedName) return null;
+    return (bookmarkTags || []).find((tag) => String(tag?.name || "").trim() === normalizedName) || null;
+}
+
+function getBookmarkTagOrderMap() {
+    const order = new Map();
+    (bookmarkTags || []).forEach((tag, index) => {
+        order.set(String(tag?.id || "").trim(), index);
+        order.set(String(tag?.name || "").trim(), index);
+    });
+    return order;
+}
+
+function normalizeBookmarkTagIdGroup(tagIds) {
+    const availableIds = new Set((bookmarkTags || []).map((tag) => String(tag?.id || "").trim()).filter(Boolean));
+    const orderMap = getBookmarkTagOrderMap();
+    const normalized = [...new Set((Array.isArray(tagIds) ? tagIds : []).map((value) => String(value || "").trim()).filter(Boolean))]
+        .filter((tagId) => availableIds.has(tagId))
+        .sort((left, right) => (orderMap.get(left) ?? 9999) - (orderMap.get(right) ?? 9999));
+    return normalized;
+}
+
+function buildBookmarkTagGroupKeyFromIds(tagIds) {
+    return normalizeBookmarkTagIdGroup(tagIds).join("\u0001");
+}
+
+function buildBookmarkTagGroupKeyFromNames(tagNames) {
+    const orderMap = getBookmarkTagOrderMap();
+    const normalized = [...new Set((Array.isArray(tagNames) ? tagNames : []).map((value) => String(value || "").trim()).filter(Boolean))]
+        .sort((left, right) => (orderMap.get(left) ?? 9999) - (orderMap.get(right) ?? 9999));
+    return normalized.join("\u0001");
+}
+
+function hydrateBookmarkTagGroup(group) {
+    const sourceTagIds = Array.isArray(group?.tagIds) && group.tagIds.length
+        ? group.tagIds
+        : (Array.isArray(group?.tagNames) ? group.tagNames.map((tagName) => getBookmarkTagByName(tagName)?.id || "") : []);
+    const normalizedTagIds = normalizeBookmarkTagIdGroup(sourceTagIds);
+    if (normalizedTagIds.length < 2) return null;
+    const tags = normalizedTagIds
+        .map((tagId) => getBookmarkTagById(tagId))
+        .filter(Boolean);
+    if (tags.length < 2) return null;
+    const tagNames = tags.map((tag) => String(tag?.name || "").trim()).filter(Boolean);
+    if (tagNames.length < 2) return null;
+    return {
+        id: buildBookmarkTagGroupKeyFromIds(normalizedTagIds),
+        tagIds: normalizedTagIds,
+        tagNames,
+        label: tagNames.join(" & "),
+    };
+}
+
+function normalizeBookmarkTagGroups(groups) {
+    const normalized = [];
+    const seen = new Set();
+    (Array.isArray(groups) ? groups : []).forEach((group) => {
+        const hydrated = hydrateBookmarkTagGroup(group);
+        if (!hydrated) return;
+        if (seen.has(hydrated.id)) return;
+        seen.add(hydrated.id);
+        normalized.push({ id: hydrated.id, tagIds: hydrated.tagIds });
+    });
+    return normalized;
+}
+
+function loadBookmarkTagGroupsFromStorage() {
+    try {
+        const raw = localStorage.getItem(STORAGE_KEYS.bookmarkTagGroups);
+        if (!raw) {
+            bookmarkTagGroups = [];
+            return;
+        }
+        bookmarkTagGroups = normalizeBookmarkTagGroups(JSON.parse(raw));
+    } catch (_error) {
+        bookmarkTagGroups = [];
+    }
+}
+
+function saveBookmarkTagGroupsToStorage() {
+    localStorage.setItem(STORAGE_KEYS.bookmarkTagGroups, JSON.stringify(bookmarkTagGroups));
+}
+
+function refreshBookmarkTagGroups() {
+    bookmarkTagGroups = normalizeBookmarkTagGroups(bookmarkTagGroups);
+    saveBookmarkTagGroupsToStorage();
+}
+
+function getBookmarkTagGroupEntries() {
+    return normalizeBookmarkTagGroups([
+        ...(Array.isArray(bookmarkTagGroups) ? bookmarkTagGroups : []),
+        ...getSelectedExtractBookmarkTagGroups().map((group) => ({ tagNames: group })),
+    ])
+        .map((group) => hydrateBookmarkTagGroup(group))
+        .filter(Boolean);
+}
+
+function isExtractBookmarkTagGroupSelected(tagNames) {
+    const targetKey = buildBookmarkTagGroupKeyFromNames(tagNames);
+    return getSelectedExtractBookmarkTagGroups().some((group) => buildBookmarkTagGroupKeyFromNames(group) === targetKey);
+}
+
+function getSelectedExtractBookmarkTagGroupByTagId(tagId) {
+    const normalizedTagId = String(tagId || "").trim();
+    if (!normalizedTagId) return null;
+    return getSelectedExtractBookmarkTagGroups()
+        .map((group) => hydrateBookmarkTagGroup({ tagNames: group }))
+        .filter(Boolean)
+        .find((group) => group.tagIds.includes(normalizedTagId)) || null;
+}
+
+function getSelectedExtractBookmarkTagGroupByName(tagName) {
+    const normalizedTagName = String(tagName || "").trim();
+    if (!normalizedTagName) return null;
+    return getSelectedExtractBookmarkTagGroups()
+        .map((group) => hydrateBookmarkTagGroup({ tagNames: group }))
+        .filter(Boolean)
+        .find((group) => group.tagNames.includes(normalizedTagName)) || null;
+}
+
+function replaceExtractBookmarkTagGroupSelection(previousTagNames, nextTagNames = []) {
+    const previousKey = buildBookmarkTagGroupKeyFromNames(previousTagNames);
+    const selectedGroups = getSelectedExtractBookmarkTagGroups();
+    const remainingGroups = selectedGroups.filter((group) => buildBookmarkTagGroupKeyFromNames(group) !== previousKey);
+    const normalizedNextGroup = normalizeBookmarkTagNameGroup(nextTagNames);
+    if (normalizedNextGroup.length >= 2) {
+        remainingGroups.push(normalizedNextGroup);
+    } else if (normalizedNextGroup.length === 1) {
+        const selectedTags = getSelectedExtractBookmarkTags();
+        if (!selectedTags.includes(normalizedNextGroup[0])) {
+            writeExtractMultiValue("extract-bookmark-tags", [...selectedTags, normalizedNextGroup[0]]);
+        }
+    }
+    writeExtractGroupValue("extract-bookmark-tag-groups", remainingGroups);
+}
+
 function getExtractFilterState() {
     // Canonical viewer-side extract filter state. Summary chips, preview requests,
     // directory scoping, and saved-filter payloads should all read from here.
@@ -6145,6 +6427,7 @@ function getExtractFilterState() {
         service: getSelectedExtractServices(),
         model: getSelectedExtractModels(),
         bookmarkTags: getSelectedExtractBookmarkTags(),
+        bookmarkTagGroups: getSelectedExtractBookmarkTagGroups(),
         bookmarked: normalizeBookmarkedFilterValue(
             document.getElementById("extract-bookmarked")?.value || "all"
         ),
@@ -6159,6 +6442,18 @@ function getExtractFilterState() {
 function getVirtualThreadFilters() {
     // Legacy alias while extract filters still flow into the virtual-thread backend.
     return getExtractFilterState();
+}
+
+function buildBookmarkTagLogicExpression() {
+    const singleTerms = getSelectedExtractBookmarkTags()
+        .map((tagName) => String(tagName || "").trim())
+        .filter(Boolean);
+    const groupTerms = getSelectedExtractBookmarkTagGroups()
+        .map((group) => normalizeBookmarkTagNameGroup(group))
+        .filter((group) => group.length > 0)
+        .map((group) => (group.length === 1 ? group[0] : `(${group.join(" ∧ ")})`));
+    const terms = [...singleTerms, ...groupTerms];
+    return terms.join(" ∨ ");
 }
 
 function syncExtractServiceButtons() {
@@ -6217,17 +6512,20 @@ function syncExtractBookmarkTagTrigger() {
     if (!label || !trigger) return;
     const availableTags = getAvailableExtractBookmarkTagEntries().map((tag) => String(tag.name || "").trim());
     const selectedTags = getSelectedExtractBookmarkTags().filter((tagName) => availableTags.includes(tagName));
+    const selectedGroups = getSelectedExtractBookmarkTagGroups();
+    const logicExpression = buildBookmarkTagLogicExpression();
+    const selectionCount = selectedTags.length + selectedGroups.length;
     if (!availableTags.length) {
         label.textContent = "タグなし";
         trigger.disabled = true;
-    } else if (!selectedTags.length) {
+    } else if (!selectionCount) {
         label.textContent = "タグを選ぶ";
         trigger.disabled = false;
-    } else if (selectedTags.length === 1) {
-        label.textContent = selectedTags[0];
+    } else if (logicExpression) {
+        label.textContent = logicExpression;
         trigger.disabled = false;
     } else {
-        label.textContent = `${selectedTags.length}件選択`;
+        label.textContent = "タグを選ぶ";
         trigger.disabled = false;
     }
 }
@@ -6264,11 +6562,14 @@ function renderExtractBookmarkTagMenu() {
     menu.innerHTML = availableTags.map((tag) => {
         const tagName = String(tag.name || "").trim();
         const active = selectedTags.includes(tagName) ? " is-filter-active" : "";
+        const selectedGroup = getSelectedExtractBookmarkTagGroupByName(tagName);
+        const locked = !!selectedGroup;
         return `
             <button
-                class="bookmark-tag-dropzone extract-bookmark-tag-option${active}"
+                class="bookmark-tag-dropzone extract-bookmark-tag-option${active}${locked ? " is-filter-locked" : ""}"
                 type="button"
                 data-value="${escapeHTML(tagName)}"
+                title="${locked ? `「${escapeHTML(selectedGroup.label)}」の一部だから単独では選べないよ` : ""}"
                 onclick="toggleExtractBookmarkTag('${escapeJsString(tagName)}', event)"
             >
                 <span class="bookmark-tag-dropzone-label">${escapeHTML(tagName)}</span>
@@ -6328,6 +6629,11 @@ function toggleExtractModel(model, event) {
 
 function toggleExtractBookmarkTag(tagName, event) {
     if (event && typeof event.preventDefault === "function") event.preventDefault();
+    const selectedGroup = getSelectedExtractBookmarkTagGroupByName(tagName);
+    if (selectedGroup) {
+        showToast(`「${selectedGroup.label}」が有効だから、このタグだけは選べないよ`);
+        return;
+    }
     const selectedTags = getSelectedExtractBookmarkTags();
     const nextTags = selectedTags.includes(tagName)
         ? selectedTags.filter((item) => item !== tagName)
@@ -6335,6 +6641,24 @@ function toggleExtractBookmarkTag(tagName, event) {
     writeExtractMultiValue("extract-bookmark-tags", nextTags);
     renderExtractBookmarkTagMenu();
     syncExtractBookmarkTagTrigger();
+    syncBookmarkWorkspaceFiltersFromExtract();
+    rerenderBookmarkManagerIfActive();
+    scheduleVirtualThreadPreview();
+}
+
+function toggleExtractBookmarkTagGroupByKey(groupKey, event) {
+    if (event && typeof event.preventDefault === "function") event.preventDefault();
+    const targetGroup = getBookmarkTagGroupEntries().find((group) => group.id === String(groupKey || ""));
+    if (!targetGroup) return;
+    const selectedGroups = getSelectedExtractBookmarkTagGroups();
+    const targetKey = buildBookmarkTagGroupKeyFromNames(targetGroup.tagNames);
+    const nextGroups = selectedGroups.some((group) => buildBookmarkTagGroupKeyFromNames(group) === targetKey)
+        ? selectedGroups.filter((group) => buildBookmarkTagGroupKeyFromNames(group) !== targetKey)
+        : [...selectedGroups, targetGroup.tagNames];
+    writeExtractGroupValue("extract-bookmark-tag-groups", nextGroups);
+    syncExtractBookmarkTagTrigger();
+    syncBookmarkWorkspaceFiltersFromExtract();
+    rerenderBookmarkManagerIfActive();
     scheduleVirtualThreadPreview();
 }
 
@@ -6372,6 +6696,11 @@ function renderActiveFilterSummary(filters) {
     (filters.bookmarkTags || []).forEach((tagName) => {
         chips.push(`<button class="extract-chip" type="button" onclick="removeExtractFilterValue('bookmarkTags', '${escapeJsString(tagName)}')"><span class="extract-chip-label">Tag: ${escapeHTML(tagName)}</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
     });
+    (filters.bookmarkTagGroups || []).forEach((group, index) => {
+        const label = normalizeBookmarkTagNameGroup(group).join(" & ");
+        if (!label) return;
+        chips.push(`<button class="extract-chip extract-chip-compound" type="button" onclick="removeExtractFilterGroup('bookmarkTagGroups', ${index})"><span class="extract-chip-label">Tag: ${escapeHTML(label)}</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
+    });
     EXTRACT_TEXT_FILTER_SPECS.forEach(({ key, summaryLabel }) => {
         const value = filters[key];
         if (String(value || "").trim()) {
@@ -6385,6 +6714,16 @@ function renderActiveFilterSummary(filters) {
     }
 
     root.innerHTML = chips.join("");
+}
+
+function removeExtractFilterGroup(kind, index) {
+    if (kind !== "bookmarkTagGroups") return;
+    const nextGroups = getSelectedExtractBookmarkTagGroups().filter((_group, groupIndex) => groupIndex !== Number(index));
+    writeExtractGroupValue("extract-bookmark-tag-groups", nextGroups);
+    syncExtractBookmarkTagTrigger();
+    syncBookmarkWorkspaceFiltersFromExtract();
+    rerenderBookmarkManagerIfActive();
+    scheduleVirtualThreadPreview();
 }
 
 function removeExtractFilterValue(kind, value) {
@@ -6407,6 +6746,8 @@ function removeExtractFilterValue(kind, value) {
         writeExtractMultiValue("extract-bookmark-tags", nextTags);
         renderExtractBookmarkTagMenu();
         syncExtractBookmarkTagTrigger();
+        syncBookmarkWorkspaceFiltersFromExtract();
+        rerenderBookmarkManagerIfActive();
     }
     scheduleVirtualThreadPreview();
 }
@@ -6415,8 +6756,11 @@ function clearExtractFilterField(key) {
     const spec = EXTRACT_TEXT_FILTER_SPECS.find((item) => item.key === key);
     if (key === "bookmarkTags") {
         writeExtractMultiValue("extract-bookmark-tags", []);
+        writeExtractGroupValue("extract-bookmark-tag-groups", []);
         renderExtractBookmarkTagMenu();
         syncExtractBookmarkTagTrigger();
+        syncBookmarkWorkspaceFiltersFromExtract();
+        rerenderBookmarkManagerIfActive();
     } else {
         const elementId = spec ? spec.elementId : key === "bookmarked" ? "extract-bookmarked" : "";
         if (!elementId) return;
@@ -6450,8 +6794,11 @@ function setVirtualThreadFilters(filters) {
     renderExtractModelMenu();
     syncExtractModelTrigger();
     writeExtractMultiValue("extract-bookmark-tags", Array.isArray(nextFilters.bookmarkTags) ? nextFilters.bookmarkTags : []);
+    writeExtractGroupValue("extract-bookmark-tag-groups", Array.isArray(nextFilters.bookmarkTagGroups) ? nextFilters.bookmarkTagGroups : []);
     renderExtractBookmarkTagMenu();
     syncExtractBookmarkTagTrigger();
+    syncBookmarkWorkspaceFiltersFromExtract();
+    rerenderBookmarkManagerIfActive();
     syncExtractSortButton();
     closeExtractModelMenu();
     closeExtractBookmarkTagMenu();
@@ -6537,6 +6884,23 @@ function requestCreateBookmarkTag(name) {
                     resolve(result ? JSON.parse(result) : null);
                 } catch (_error) {
                     resolve(null);
+                }
+            });
+        });
+    });
+}
+
+function requestRenameBookmarkTag(tagId, name) {
+    return waitForBridge().then((bridge) => {
+        if (!bridge || !bridge.renameBookmarkTag) {
+            return { renamed: 0, error: "bridge_unavailable" };
+        }
+        return new Promise((resolve) => {
+            bridge.renameBookmarkTag(JSON.stringify({ tagId, name }), function (result) {
+                try {
+                    resolve(result ? JSON.parse(result) : { renamed: 0 });
+                } catch (_error) {
+                    resolve({ renamed: 0 });
                 }
             });
         });
@@ -7381,24 +7745,27 @@ function buildRecentFiltersMarkup() {
             entry.filters || {}
         );
         return `
-            <article class="extract-history-item">
+            <article
+                class="extract-history-item extract-history-item-draggable${matchingStarredFilter ? " is-pinned" : ""}"
+                data-filter-history-payload="${serializedFilters}"
+                data-filter-history-label="${escapeHTML(entry.label || "Recent Filter")}"
+                onpointerdown="armRecentFilterDrag('${serializedFilters}', '${escapeJsString(entry.label || "Recent Filter")}', event)"
+            >
                 <div class="extract-history-meta">
                     <div class="extract-history-meta-main">
                         <span class="extract-history-label">${escapeHTML(entry.label || "Recent Filter")}</span>
                         <span class="extract-history-date">${escapeHTML(usedAt)}</span>
                     </div>
                     <div class="extract-history-tools">
-                        <button class="extract-history-btn" type="button" onclick="applySavedFilterToDirectory('${serializedFilters}')">開く</button>
-                        <button class="extract-history-btn extract-history-icon-btn circle-pill circle-pill-md" type="button" title="編集" aria-label="編集" onclick="reuseSavedFilter('${serializedFilters}')">✎</button>
                         ${buildBookmarkToggleButtonHtml(
                             starTargetSpec,
                             Boolean(matchingStarredFilter),
                             `toggleRecentFilterStarByPayload('${serializedFilters}', event)`,
                             "prompt-bookmark-btn",
                             {
-                                iconKind: "tab-button-kind-filter",
-                                activeTitle: "保存を外す",
-                                inactiveTitle: "保存する",
+                                iconKind: "tab-button-kind-pin",
+                                activeTitle: "固定を外す",
+                                inactiveTitle: "固定する",
                             }
                         )}
                     </div>
@@ -7456,6 +7823,336 @@ function getBookmarkTagById(tagId) {
     return (bookmarkTags || []).find((tag) => String(tag.id) === String(tagId)) || null;
 }
 
+function migrateBookmarkTagNameInExtractFilters(previousName, nextName) {
+    const oldName = String(previousName || "").trim();
+    const newName = String(nextName || "").trim();
+    if (!oldName || !newName || oldName === newName) return;
+    const nextSelectedTags = getSelectedExtractBookmarkTags().map((tagName) =>
+        String(tagName || "").trim() === oldName ? newName : tagName
+    );
+    const dedupedTags = Array.from(new Set(nextSelectedTags.map((tagName) => String(tagName || "").trim()).filter(Boolean)));
+    writeExtractMultiValue("extract-bookmark-tags", dedupedTags);
+    const nextSelectedGroups = getSelectedExtractBookmarkTagGroups().map((group) =>
+        normalizeBookmarkTagNameGroup(group.map((tagName) =>
+            String(tagName || "").trim() === oldName ? newName : tagName
+        ))
+    ).filter((group) => group.length >= 2);
+    writeExtractGroupValue("extract-bookmark-tag-groups", nextSelectedGroups);
+}
+
+function syncBookmarkWorkspaceFiltersFromExtract() {
+    const selectedTagNames = new Set(getSelectedExtractBookmarkTags());
+    selectedBookmarkTagFilterIds = (bookmarkTags || [])
+        .filter((tag) => selectedTagNames.has(String(tag?.name || "").trim()))
+        .map((tag) => String(tag.id));
+}
+
+function rerenderBookmarkManagerIfActive() {
+    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+        renderActiveTab();
+    }
+}
+
+function addTagToExtractFilters(tagId) {
+    const tag = getBookmarkTagById(tagId);
+    if (!tag) {
+        showToast("タグを見つけられなかったよ");
+        return false;
+    }
+    const tagName = String(tag.name || "").trim();
+    if (!tagName) {
+        showToast("タグ名が空だったよ");
+        return false;
+    }
+    const selectedGroup = getSelectedExtractBookmarkTagGroupByName(tagName);
+    if (selectedGroup) {
+        showToast(`「${selectedGroup.label}」が有効だから、このタグだけは足せないよ`);
+        return false;
+    }
+    const selectedTags = getSelectedExtractBookmarkTags();
+    if (selectedTags.includes(tagName)) {
+        showToast(`Tag に「${tagName}」はもう入ってるよ`);
+        return false;
+    }
+    writeExtractMultiValue("extract-bookmark-tags", [...selectedTags, tagName]);
+    renderExtractBookmarkTagMenu();
+    syncExtractBookmarkTagTrigger();
+    syncBookmarkWorkspaceFiltersFromExtract();
+    rerenderBookmarkManagerIfActive();
+    scheduleVirtualThreadPreview();
+    showToast(`Tag 条件に「${tagName}」を足したよ`);
+    return true;
+}
+
+function startBookmarkTagRename(tagId, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const tag = getBookmarkTagById(tagId);
+    if (!tag) {
+        showToast("タグを見つけられなかったよ");
+        return false;
+    }
+    editingBookmarkTagId = String(tag.id);
+    editingBookmarkTagName = String(tag.name || "").trim();
+    rerenderBookmarkManagerIfActive();
+    window.requestAnimationFrame(() => {
+        const input = document.getElementById(`bookmark-tag-rename-input-${editingBookmarkTagId}`);
+        if (input instanceof HTMLInputElement) {
+            input.focus();
+            input.select();
+        }
+    });
+    return true;
+}
+
+function updateBookmarkTagRenameDraft(tagId, value) {
+    if (String(tagId) !== String(editingBookmarkTagId)) return;
+    editingBookmarkTagName = String(value || "");
+}
+
+function cancelBookmarkTagRename(tagId, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (String(tagId) !== String(editingBookmarkTagId)) return false;
+    editingBookmarkTagId = "";
+    editingBookmarkTagName = "";
+    bookmarkTagRenameSavingId = "";
+    rerenderBookmarkManagerIfActive();
+    return true;
+}
+
+async function commitBookmarkTagRename(tagId, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const normalizedTagId = String(tagId || "").trim();
+    if (!normalizedTagId || normalizedTagId !== String(editingBookmarkTagId)) {
+        return false;
+    }
+    if (bookmarkTagRenameSavingId === normalizedTagId) {
+        return false;
+    }
+    const tag = getBookmarkTagById(normalizedTagId);
+    if (!tag) {
+        cancelBookmarkTagRename(normalizedTagId);
+        showToast("タグを見つけられなかったよ");
+        return false;
+    }
+    const currentName = String(tag.name || "").trim();
+    const nextName = String(editingBookmarkTagName || "").trim();
+    if (!nextName) {
+        showToast("タグ名を入れてね");
+        return false;
+    }
+    if (nextName === currentName) {
+        cancelBookmarkTagRename(normalizedTagId);
+        return false;
+    }
+    bookmarkTagRenameSavingId = normalizedTagId;
+    const renamed = await requestRenameBookmarkTag(tag.id, nextName);
+    bookmarkTagRenameSavingId = "";
+    if (!renamed?.renamed) {
+        if (renamed?.error === "duplicate") {
+            showToast(`タグ「${nextName}」はもうあるよ`);
+        } else {
+            showToast("タグ名を変えられなかったよ");
+        }
+        return false;
+    }
+    editingBookmarkTagId = "";
+    editingBookmarkTagName = "";
+    migrateBookmarkTagNameInExtractFilters(currentName, renamed.name || nextName);
+    await Promise.all([
+        refreshBookmarkTags(),
+        refreshRecentFilters(),
+        refreshStarredFilters(),
+    ]);
+    showToast(`タグ名を「${renamed.name || nextName}」に変えたよ`);
+    return true;
+}
+
+function handleBookmarkTagRenameKeydown(tagId, event) {
+    if (event?.key === "Enter") {
+        commitBookmarkTagRename(tagId, event);
+        return;
+    }
+    if (event?.key === "Escape") {
+        cancelBookmarkTagRename(tagId, event);
+    }
+}
+
+function handleBookmarkTagRenameBlur(tagId, event) {
+    const nextFocus = event?.relatedTarget;
+    if (nextFocus?.closest?.(".bookmark-tag-inline-editor")) {
+        return;
+    }
+    commitBookmarkTagRename(tagId, event);
+}
+
+function addTagGroupToExtractFilters(groupKey) {
+    const group = getBookmarkTagGroupEntries().find((entry) => entry.id === String(groupKey || ""));
+    if (!group) {
+        showToast("結合タグを見つけられなかったよ");
+        return false;
+    }
+    const selectedGroups = getSelectedExtractBookmarkTagGroups();
+    const targetKey = buildBookmarkTagGroupKeyFromNames(group.tagNames);
+    if (selectedGroups.some((entry) => buildBookmarkTagGroupKeyFromNames(entry) === targetKey)) {
+        showToast(`Tag 条件に「${group.label}」はもう入ってるよ`);
+        return false;
+    }
+    writeExtractGroupValue("extract-bookmark-tag-groups", [...selectedGroups, group.tagNames]);
+    syncExtractBookmarkTagTrigger();
+    syncBookmarkWorkspaceFiltersFromExtract();
+    rerenderBookmarkManagerIfActive();
+    scheduleVirtualThreadPreview();
+    showToast(`結合タグ「${group.label}」を Tag 条件に足したよ`);
+    return true;
+}
+
+function buildBookmarkTagGroupFromIds(tagIds) {
+    return hydrateBookmarkTagGroup({ tagIds });
+}
+
+function createBookmarkTagGroupFromTagIds(tagIds) {
+    const created = buildBookmarkTagGroupFromIds(tagIds);
+    if (!created) {
+        showToast("2つ以上のタグで結合してね");
+        return false;
+    }
+    const targetNames = created.tagNames;
+    const targetNameSet = new Set(targetNames);
+    const selectedGroups = getSelectedExtractBookmarkTagGroups();
+    const targetKey = buildBookmarkTagGroupKeyFromNames(created.tagNames);
+    const nextGroups = selectedGroups.filter((group) => {
+        const normalizedGroup = normalizeBookmarkTagNameGroup(group);
+        const groupKey = buildBookmarkTagGroupKeyFromNames(normalizedGroup);
+        if (groupKey === targetKey) {
+            return false;
+        }
+        return !normalizedGroup.every((tagName) => targetNameSet.has(tagName));
+    });
+    nextGroups.push(targetNames);
+    const nextSingleTags = getSelectedExtractBookmarkTags().filter((tagName) => !targetNameSet.has(String(tagName || "").trim()));
+    bookmarkTagGroups = normalizeBookmarkTagGroups([
+        ...(Array.isArray(bookmarkTagGroups) ? bookmarkTagGroups : []),
+        { tagIds: created.tagIds },
+    ]);
+    saveBookmarkTagGroupsToStorage();
+    writeExtractMultiValue("extract-bookmark-tags", nextSingleTags);
+    writeExtractGroupValue("extract-bookmark-tag-groups", nextGroups);
+    syncExtractBookmarkTagTrigger();
+    syncBookmarkWorkspaceFiltersFromExtract();
+    rerenderBookmarkManagerIfActive();
+    scheduleVirtualThreadPreview();
+    showToast(`タグを結合して「${created.label}」にしたよ`);
+    return true;
+}
+
+function removeBookmarkTagFromGroup(groupKey, tagId, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const targetKey = String(groupKey || "").trim();
+    const targetTagId = String(tagId || "").trim();
+    if (!targetKey || !targetTagId) return false;
+    const hydratedGroup = getBookmarkTagGroupEntries().find((group) => String(group?.id || "").trim() === targetKey);
+    if (!hydratedGroup) {
+        showToast("結合タグを見つけられなかったよ");
+        return false;
+    }
+    const remainingTagIds = hydratedGroup.tagIds.filter((candidateId) => candidateId !== targetTagId);
+    if (remainingTagIds.length === hydratedGroup.tagIds.length) {
+        showToast("そのタグは結合タグに入っていなかったよ");
+        return false;
+    }
+    let nextGroup = null;
+    if (remainingTagIds.length >= 2) {
+        nextGroup = buildBookmarkTagGroupFromIds(remainingTagIds);
+    }
+    bookmarkTagGroups = normalizeBookmarkTagGroups(
+        (Array.isArray(bookmarkTagGroups) ? bookmarkTagGroups : []).flatMap((group) => {
+            const hydrated = hydrateBookmarkTagGroup(group);
+            if (!hydrated || hydrated.id !== targetKey) {
+                return group;
+            }
+            return nextGroup ? [{ tagIds: nextGroup.tagIds }] : [];
+        })
+    );
+    saveBookmarkTagGroupsToStorage();
+    if (isExtractBookmarkTagGroupSelected(hydratedGroup.tagNames)) {
+        replaceExtractBookmarkTagGroupSelection(hydratedGroup.tagNames, nextGroup?.tagNames || remainingTagIds.map((id) => getBookmarkTagById(id)?.name || "").filter(Boolean));
+    }
+    renderExtractBookmarkTagMenu();
+    syncExtractBookmarkTagTrigger();
+    syncBookmarkWorkspaceFiltersFromExtract();
+    rerenderBookmarkManagerIfActive();
+    scheduleVirtualThreadPreview();
+    if (nextGroup) {
+        showToast(`結合タグを「${nextGroup.label}」に更新したよ`);
+    } else if (remainingTagIds.length === 1) {
+        const remainingTag = getBookmarkTagById(remainingTagIds[0]);
+        showToast(`結合タグを外して「${remainingTag?.name || "Tag"}」に戻したよ`);
+    } else {
+        showToast("結合タグを外したよ");
+    }
+    return true;
+}
+
+function handleBookmarkTagGroupCardClick(groupKey, event) {
+    if (event?.target?.closest?.(".bookmark-tag-group-member-chip")) {
+        return;
+    }
+    toggleExtractBookmarkTagGroupByKey(groupKey, event);
+}
+
+function buildBookmarkWorkspaceFilterChipsMarkup() {
+    const activeFilterSet = new Set((selectedBookmarkTagFilterIds || []).map((id) => String(id)));
+    const singleTagMarkup = (bookmarkTags || [])
+        .filter((tag) => activeFilterSet.has(String(tag.id)))
+        .map((tag) => `
+            <button class="extract-chip" type="button" onclick="removeExtractFilterValue('bookmarkTags', '${escapeJsString(String(tag.name || '').trim())}')">
+                <span class="extract-chip-label">${escapeHTML(tag.name || "Tag")}</span>
+                <span class="extract-chip-remove" aria-hidden="true">×</span>
+            </button>
+        `);
+    const groupMarkup = getSelectedExtractBookmarkTagGroups()
+        .map((group) => hydrateBookmarkTagGroup({ tagNames: group }))
+        .filter(Boolean)
+        .map((group) => `
+            <div class="bookmark-workspace-filter-group" title="結合: ${escapeHTML(group.label)}">
+                ${group.tagIds.map((tagId, index) => {
+                    const memberTag = getBookmarkTagById(tagId);
+                    const memberName = String(memberTag?.name || "").trim();
+                    if (!memberName) return "";
+                    const separator = index > 0
+                        ? `<span class="bookmark-workspace-filter-separator" aria-hidden="true">&</span>`
+                        : "";
+                    return `
+                        ${separator}
+                        <button
+                            class="extract-chip extract-chip-compound"
+                            type="button"
+                            onclick="removeBookmarkTagFromGroup('${escapeJsString(group.id)}', '${escapeJsString(tagId)}', event)"
+                        >
+                            <span class="extract-chip-label">${escapeHTML(memberName)}</span>
+                            <span class="extract-chip-remove" aria-hidden="true">×</span>
+                        </button>
+                    `;
+                }).join("")}
+            </div>
+        `);
+    const markup = [...singleTagMarkup, ...groupMarkup].join("");
+    if (markup) return markup;
+    return '<span class="bookmark-workspace-chip">複数選択: OR / ドラッグで結合: AND</span>';
+}
+
+function applyRecentFilterPayloadToExtractSummary(payload) {
+    const normalizedPayload = String(payload || "").trim();
+    if (!normalizedPayload) return false;
+    loadStoredFilterIntoExtractPanel(normalizedPayload);
+    showToast("履歴の条件を検索パネルへ適用したよ");
+    return true;
+}
+
 function getBookmarkWorkspaceSelectionSummary() {
     const selectedCount = selectedDirectoryPromptKeys.length;
     if (selectedCount > 0) {
@@ -7478,16 +8175,35 @@ function entryHasBookmarkTag(entry, tagId) {
     return Array.isArray(entry?.tags) && entry.tags.some((tag) => String(tag?.id) === String(tagId));
 }
 
+function getBookmarkTagGroupPromptCount(group) {
+    const requiredTagIds = Array.isArray(group?.tagIds)
+        ? group.tagIds.map((tagId) => String(tagId || "").trim()).filter(Boolean)
+        : [];
+    if (!requiredTagIds.length) return 0;
+    return (starredPromptEntries || []).filter((entry) =>
+        requiredTagIds.every((tagId) => entryHasBookmarkTag(entry, tagId))
+    ).length;
+}
+
 function getFilteredStarredPromptEntries() {
     const selectedFilterIds = Array.isArray(selectedBookmarkTagFilterIds)
         ? selectedBookmarkTagFilterIds.map((id) => String(id))
         : [];
-    if (!selectedFilterIds.length) {
+    const selectedTagGroups = getSelectedExtractBookmarkTagGroups();
+    if (!selectedFilterIds.length && !selectedTagGroups.length) {
         return Array.isArray(starredPromptEntries) ? starredPromptEntries.slice() : [];
     }
-    return (starredPromptEntries || []).filter((entry) =>
-        selectedFilterIds.every((tagId) => entryHasBookmarkTag(entry, tagId))
-    );
+    return (starredPromptEntries || []).filter((entry) => {
+        const matchesSingle = selectedFilterIds.length
+            ? selectedFilterIds.some((tagId) => entryHasBookmarkTag(entry, tagId))
+            : false;
+        const matchesGroup = selectedTagGroups.some((group) =>
+            normalizeBookmarkTagNameGroup(group).every((tagName) =>
+                Array.isArray(entry?.tags) && entry.tags.some((tag) => String(tag?.name || "").trim() === tagName)
+            )
+        );
+        return matchesSingle || matchesGroup;
+    });
 }
 
 function restoreBookmarkTagFilters(filterIds) {
@@ -7507,9 +8223,8 @@ function syncStarredPromptSelectionControls() {
         summaryNode.textContent = getBookmarkWorkspaceSelectionSummary();
     }
     if (filterSummaryNode) {
-        filterSummaryNode.textContent = selectedBookmarkTagFilterIds.length > 0
-            ? `${selectedBookmarkTagFilterIds.length}個のタグで絞り込み中`
-            : "タグボタンはフィルタ専用 / 複数選択は AND";
+        const logicExpression = buildBookmarkTagLogicExpression();
+        filterSummaryNode.textContent = logicExpression || "複数選択: OR / ドラッグで結合: AND";
     }
 }
 
@@ -7608,6 +8323,12 @@ function selectStarredPromptEntry(targetKey, event) {
 function buildStarredPromptManagerControlsHtml() {
     const regularTags = bookmarkTags || [];
     const activeFilterSet = new Set((selectedBookmarkTagFilterIds || []).map((id) => String(id)));
+    const compoundGroups = getBookmarkTagGroupEntries()
+        .filter((group) => isExtractBookmarkTagGroupSelected(group.tagNames));
+    const compoundMemberIdSet = new Set(
+        compoundGroups.flatMap((group) => group.tagIds.map((tagId) => String(tagId || "").trim()).filter(Boolean))
+    );
+    const visibleRegularTags = regularTags.filter((tag) => !compoundMemberIdSet.has(String(tag.id || "").trim()));
     return `
         <div class="manager-tab-toolbar">
             <div class="manager-tab-toolbar-left">
@@ -7620,46 +8341,110 @@ function buildStarredPromptManagerControlsHtml() {
                 <div class="manager-tab-toolbar-meta bookmark-tag-filter-meta">
                     <span class="manager-tab-toolbar-title">タグ</span>
                     <span class="manager-tab-toolbar-summary" id="starred-prompts-filter-summary">${
-                        activeFilterSet.size > 0
-                            ? `${activeFilterSet.size}個のタグで絞り込み中`
-                            : "タグボタンはフィルタ専用 / 複数選択は AND"
+                        buildBookmarkTagLogicExpression() || "複数選択: OR / ドラッグで結合: AND"
                     }</span>
                 </div>
                 <div class="bookmark-tag-create">
                     <input id="bookmark-tag-name-input" type="text" placeholder="新しいタグ" onkeydown="handleBookmarkTagCreateKeydown(event)">
                     <button class="extract-history-btn" type="button" onclick="createBookmarkTagFromInput()">タグを作成</button>
-                    <button
-                        class="extract-history-btn"
-                        type="button"
-                        onclick="clearBookmarkTagFilters(event)"
-                        ${activeFilterSet.size > 0 ? "" : "disabled"}
-                    >絞り込み解除</button>
                 </div>
                 <div class="bookmark-tag-dropzones">
-                    ${(regularTags || []).map((tag) => `
-                        <button
-                            class="bookmark-tag-dropzone ${activeFilterSet.has(String(tag.id)) ? "is-filter-active" : ""}"
-                            type="button"
+                    ${visibleRegularTags.map((tag) => `
+                        <div
+                            class="bookmark-tag-dropzone ${activeFilterSet.has(String(tag.id)) ? "is-filter-active" : ""} ${String(editingBookmarkTagId) === String(tag.id) ? "is-editing" : ""}"
+                            role="button"
+                            tabindex="0"
                             data-bookmark-dropzone-kind="assign-tag"
                             data-bookmark-tag-id="${escapeHTML(String(tag.id))}"
                             aria-pressed="${activeFilterSet.has(String(tag.id)) ? "true" : "false"}"
-                            title="クリックで絞り込み / タグをサイドバーへ落とすと付与 / サイドバーの対象をここへ落としても付与"
-                            onclick="toggleBookmarkTagFilter(${Number.parseInt(tag.id, 10)}, event)"
-                            onpointerdown="armBookmarkTagDrag(${Number.parseInt(tag.id, 10)}, event)"
+                            title="クリックで絞り込み / ✎ で名前変更 / タグをサイドバーへ落とすと付与 / サイドバーの対象をここへ落としても付与"
+                            ${String(editingBookmarkTagId) === String(tag.id)
+                                ? ""
+                                : `onclick="toggleBookmarkTagFilter(${Number.parseInt(tag.id, 10)}, event)" onpointerdown="armBookmarkTagDrag(${Number.parseInt(tag.id, 10)}, event)"`}
                         >
-                            <span class="bookmark-tag-dropzone-label">${escapeHTML(tag.name || "Tag")}</span>
+                            ${String(editingBookmarkTagId) === String(tag.id) ? `
+                                <span class="bookmark-tag-inline-editor" onclick="event.stopPropagation()" onpointerdown="event.stopPropagation()">
+                                    <input
+                                        id="bookmark-tag-rename-input-${escapeHTML(String(tag.id))}"
+                                        class="bookmark-tag-inline-input"
+                                        type="text"
+                                        value="${escapeHTML(editingBookmarkTagName || tag.name || "")}"
+                                        oninput="updateBookmarkTagRenameDraft('${escapeJsString(String(tag.id))}', this.value)"
+                                        onkeydown="handleBookmarkTagRenameKeydown('${escapeJsString(String(tag.id))}', event)"
+                                        onblur="handleBookmarkTagRenameBlur('${escapeJsString(String(tag.id))}', event)"
+                                    >
+                                    <button
+                                        class="bookmark-tag-inline-action"
+                                        type="button"
+                                        title="保存"
+                                        onclick="commitBookmarkTagRename('${escapeJsString(String(tag.id))}', event)"
+                                    >✓</button>
+                                    <button
+                                        class="bookmark-tag-inline-action"
+                                        type="button"
+                                        title="キャンセル"
+                                        onclick="cancelBookmarkTagRename('${escapeJsString(String(tag.id))}', event)"
+                                    >×</button>
+                                </span>
+                            ` : `
+                                <span class="bookmark-tag-dropzone-label">${escapeHTML(tag.name || "Tag")}</span>
+                                <span
+                                    class="bookmark-tag-dropzone-edit"
+                                    role="button"
+                                    tabindex="-1"
+                                    title="タグ名を変更"
+                                    onclick="startBookmarkTagRename('${escapeJsString(String(tag.id))}', event)"
+                                >✎</span>
+                            `}
                             <span class="bookmark-tag-dropzone-count">${escapeHTML(String(tag.bookmarkCount || 0))}</span>
-                        </button>
+                        </div>
                     `).join("")}
+                    ${compoundGroups.length ? compoundGroups.map((group) => `
+                        <div
+                            class="bookmark-tag-dropzone bookmark-tag-group-card is-filter-active"
+                            data-bookmark-dropzone-kind="compound-tag-group"
+                            data-bookmark-tag-group-key="${escapeHTML(group.id)}"
+                            role="button"
+                            tabindex="0"
+                            title="結合タグ: ${escapeHTML(group.label)}"
+                            aria-pressed="true"
+                            onclick="handleBookmarkTagGroupCardClick('${escapeJsString(group.id)}', event)"
+                        >
+                            <div class="bookmark-tag-group-members">
+                                ${group.tagIds.map((tagId, index) => {
+                                    const memberTag = getBookmarkTagById(tagId);
+                                    const memberName = String(memberTag?.name || "").trim();
+                                    if (!memberName) return "";
+                                    const separator = index > 0
+                                        ? `<span class="bookmark-tag-group-separator" aria-hidden="true">&</span>`
+                                        : "";
+                                    return `
+                                        ${separator}
+                                        <button
+                                            class="extract-chip bookmark-tag-group-member-chip"
+                                            type="button"
+                                            title="結合から ${escapeHTML(memberName)} を外す"
+                                            onclick="removeBookmarkTagFromGroup('${escapeJsString(group.id)}', '${escapeJsString(tagId)}', event)"
+                                        >
+                                            <span class="extract-chip-label">${escapeHTML(memberName)}</span>
+                                            <span class="extract-chip-remove" aria-hidden="true">×</span>
+                                        </button>
+                                    `;
+                                }).join("")}
+                            </div>
+                            <span class="bookmark-tag-dropzone-count">${escapeHTML(String(getBookmarkTagGroupPromptCount(group)))}</span>
+                        </div>
+                    `).join("") : ""}
                     <button
                         class="bookmark-tag-dropzone bookmark-tag-dropzone-remove"
                         type="button"
                         data-bookmark-dropzone-kind="remove-tag"
-                        title="× をサイドバーへ落とすとタグ解除 / サイドバーの対象をここへ落とすとタグをまとめて外す / タグチップをドロップするとそのタグだけ外す"
+                        title="クリックで絞り込み解除 / サイドバーの対象をここへ落とすとタグをまとめて外す / タグチップをドロップするとそのタグだけ外す"
+                        onclick="clearBookmarkTagFilters(event)"
                         onpointerdown="armBookmarkRemoveToolDrag(event)"
                     >
                         <span class="bookmark-tag-dropzone-remove-icon" aria-hidden="true">×</span>
-                        <span class="bookmark-tag-dropzone-label">選択中からタグ解除</span>
+                        <span class="bookmark-tag-dropzone-label">絞り込み解除</span>
                     </button>
                 </div>
             </div>
@@ -7668,40 +8453,53 @@ function buildStarredPromptManagerControlsHtml() {
 }
 
 function buildBookmarkTagWorkspaceMarkup() {
-    const activeFilterSet = new Set((selectedBookmarkTagFilterIds || []).map((id) => String(id)));
-    const activeTagNames = (bookmarkTags || [])
-        .filter((tag) => activeFilterSet.has(String(tag.id)))
-        .map((tag) => tag.name || "Tag");
     const selectedCount = selectedDirectoryPromptKeys.length;
+    const targetSummary = selectedCount > 0
+        ? `サイドバーで選んだ ${selectedCount} 件の prompt をまとめて操作できるよ。`
+        : "サイドバーのフォルダや prompt をタグボタンか × にドラッグして操作してね。";
+    const logicExpression = buildBookmarkTagLogicExpression();
+    const filterSummary = logicExpression
+        ? `いまは ${logicExpression}。`
+        : "複数選択: OR / ドラッグで結合: AND";
     return `
         <div class="bookmark-workspace">
-            <section class="bookmark-workspace-card">
-                <h3 class="bookmark-workspace-title">操作対象</h3>
-                <p class="bookmark-workspace-summary">${
-                    selectedCount > 0
-                        ? `サイドバーで選んだ ${selectedCount} 件の prompt をまとめて操作できるよ。`
-                        : "サイドバーのフォルダや prompt をタグボタンか × にドラッグして操作してね。"
-                }</p>
-                <div class="bookmark-workspace-chip-list">
-                    <span class="bookmark-workspace-chip">Shift+クリックで範囲選択</span>
-                    <span class="bookmark-workspace-chip">フォルダは今見えている prompt 全体</span>
+            <details class="bookmark-workspace-card bookmark-workspace-collapsible">
+                <summary class="bookmark-workspace-summary-toggle">
+                    <span class="bookmark-workspace-title">操作対象・使い方・フィルタ</span>
+                    <span class="bookmark-workspace-caret" aria-hidden="true"></span>
+                </summary>
+                <div class="bookmark-workspace-group">
+                    <h4 class="bookmark-workspace-subtitle">操作対象</h4>
+                    <p class="bookmark-workspace-summary">${targetSummary}</p>
+                    <div class="bookmark-workspace-chip-list">
+                        <span class="bookmark-workspace-chip">Shift+クリックで範囲選択</span>
+                        <span class="bookmark-workspace-chip">フォルダは今見えている prompt 全体</span>
+                    </div>
                 </div>
-            </section>
-            <section class="bookmark-workspace-card">
-                <h3 class="bookmark-workspace-title">使い方</h3>
-                <ul class="bookmark-workspace-list">
-                    <li>タグボタン → サイドバー: そのフォルダや prompt にタグ付与</li>
-                    <li>サイドバー → タグボタン: 選んだ対象へタグ付与</li>
-                    <li>サイドバー → ×: 対象についているタグをまとめて解除</li>
-                </ul>
-            </section>
-            <section class="bookmark-workspace-card">
-                <h3 class="bookmark-workspace-title">フィルタ</h3>
-                <p class="bookmark-workspace-summary">${
-                    activeTagNames.length
-                        ? `いまは ${activeTagNames.join(" / ")} で AND 絞り込み中。`
-                        : "タグボタンのクリックはフィルタ専用。複数タグは AND で効くよ。"
-                }</p>
+                <div class="bookmark-workspace-group">
+                    <h4 class="bookmark-workspace-subtitle">使い方</h4>
+                    <ul class="bookmark-workspace-list">
+                        <li>タグボタン → サイドバー: そのフォルダや prompt にタグ付与</li>
+                        <li>サイドバー → タグボタン: 選んだ対象へタグ付与</li>
+                        <li>サイドバー → ×: 対象についているタグをまとめて解除</li>
+                    </ul>
+                </div>
+                <div class="bookmark-workspace-group">
+                    <h4 class="bookmark-workspace-subtitle">フィルタ</h4>
+                    <p class="bookmark-workspace-summary">${filterSummary}</p>
+                    <div class="bookmark-workspace-filter-list">
+                        ${buildBookmarkWorkspaceFilterChipsMarkup()}
+                    </div>
+                </div>
+            </details>
+            <section class="bookmark-workspace-card extract-history-section bookmark-workspace-history">
+                <div class="extract-history-header">
+                    <div class="extract-history-heading">
+                        <h3><span class="tab-button-kind tab-button-kind-icon tab-button-kind-clock extract-history-title-icon" aria-hidden="true"></span><span>履歴</span></h3>
+                        <div class="extract-history-note">ここから検索パネルへドラッグできるよ</div>
+                    </div>
+                </div>
+                <div id="extract-history-list" class="extract-history-list"></div>
             </section>
         </div>
     `;
@@ -7777,7 +8575,9 @@ async function refreshStarredPrompts() {
 }
 
 async function refreshBookmarkTags() {
+    loadBookmarkTagGroupsFromStorage();
     bookmarkTags = await requestBookmarkTags();
+    syncBookmarkWorkspaceFiltersFromExtract();
     const visibleTagIds = new Set((bookmarkTags || []).map((tag) => String(tag.id)));
     selectedBookmarkTagFilterIds = selectedBookmarkTagFilterIds.filter((tagId) => visibleTagIds.has(String(tagId)));
     const visibleTagNames = new Set((bookmarkTags || []).map((tag) => String(tag.name || "").trim()).filter(Boolean));
@@ -7785,8 +8585,22 @@ async function refreshBookmarkTags() {
         "extract-bookmark-tags",
         getSelectedExtractBookmarkTags().filter((tagName) => visibleTagNames.has(String(tagName || "").trim()))
     );
+    writeExtractGroupValue(
+        "extract-bookmark-tag-groups",
+        getSelectedExtractBookmarkTagGroups().filter((group) =>
+            normalizeBookmarkTagNameGroup(group).every((tagName) => visibleTagNames.has(String(tagName || "").trim()))
+        )
+    );
+    bookmarkTagGroups = normalizeBookmarkTagGroups(
+        (Array.isArray(bookmarkTagGroups) ? bookmarkTagGroups : []).filter((group) => {
+            const hydrated = hydrateBookmarkTagGroup(group);
+            return hydrated && hydrated.tagNames.every((tagName) => visibleTagNames.has(String(tagName || "").trim()));
+        })
+    );
+    saveBookmarkTagGroupsToStorage();
     renderExtractBookmarkTagMenu();
     syncExtractBookmarkTagTrigger();
+    syncBookmarkWorkspaceFiltersFromExtract();
     if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
         renderActiveTab();
     }
@@ -7818,8 +8632,11 @@ function getSelectedStarredPromptTagSummaries() {
 }
 
 function clearBookmarkSelectionDropzones() {
-    document.querySelectorAll(".bookmark-tag-dropzone.is-drag-over, .prompt-item-row.is-drag-over, .tree-summary.is-drag-over").forEach((node) => {
+    document.querySelectorAll(".bookmark-tag-dropzone.is-drag-over, .prompt-item-row.is-drag-over, .tree-summary.is-drag-over, .extract-summary.is-drag-over, .sidebar-mode-btn.is-drag-over, #sidebar.is-drag-over, #thread-list-panel.is-drag-over").forEach((node) => {
         node.classList.remove("is-drag-over");
+        if (node instanceof HTMLElement && node.dataset.dropLabel) {
+            delete node.dataset.dropLabel;
+        }
     });
 }
 
@@ -7851,6 +8668,7 @@ function armStarredPromptDrag(selectionKey, event) {
         hoverKind: "",
         hoverTagId: "",
     };
+    event?.preventDefault?.();
 }
 
 function armBookmarkTagDrag(tagId, event) {
@@ -7868,6 +8686,25 @@ function armBookmarkTagDrag(tagId, event) {
         hoverKind: "",
         hoverTagId: "",
     };
+    event?.preventDefault?.();
+}
+
+function armRecentFilterDrag(payload, label, event) {
+    if ((event?.button ?? 0) !== 0) return;
+    if (event?.target?.closest?.("button")) return;
+    const normalizedPayload = String(payload || "").trim();
+    if (!normalizedPayload) return;
+    bookmarkSelectionDragState = {
+        dragKind: "recent-filter",
+        filterPayload: normalizedPayload,
+        filterLabel: String(label || "Recent Filter"),
+        startX: event?.clientX ?? 0,
+        startY: event?.clientY ?? 0,
+        active: false,
+        hoverKind: "",
+        hoverTagId: "",
+    };
+    event?.preventDefault?.();
 }
 
 function armBookmarkRemoveToolDrag(event) {
@@ -7881,6 +8718,7 @@ function armBookmarkRemoveToolDrag(event) {
         hoverKind: "",
         hoverTagId: "",
     };
+    event?.preventDefault?.();
 }
 
 function armBookmarkEntryTagDrag(tagId, event) {
@@ -7909,9 +8747,15 @@ function isValidBookmarkDropTarget(dragKind, hoverKind) {
     if (dragKind === "tag") {
         return (
             hoverKind === "remove-tag" ||
+            hoverKind === "assign-tag" ||
+            hoverKind === "compound-tag-group" ||
+            hoverKind === "extract-summary" ||
             hoverKind === "directory-prompt" ||
             hoverKind === "directory-folder"
         );
+    }
+    if (dragKind === "recent-filter") {
+        return hoverKind === "extract-summary" || hoverKind === "directory-mode";
     }
     if (dragKind === "tag-remove-tool") {
         return hoverKind === "directory-prompt" || hoverKind === "directory-folder";
@@ -7920,14 +8764,41 @@ function isValidBookmarkDropTarget(dragKind, hoverKind) {
 }
 
 function updateBookmarkSelectionDropTarget(clientX, clientY) {
-    const hovered = document
-        .elementFromPoint(clientX, clientY)
-        ?.closest(".bookmark-tag-dropzone, .prompt-item-row[data-directory-drop-kind], .tree-summary[data-directory-drop-kind]");
+    const rawHoveredNode = document.elementFromPoint(clientX, clientY);
+    const hoveredNode = rawHoveredNode
+        ?.closest(".bookmark-tag-dropzone, .prompt-item-row[data-directory-drop-kind], .tree-summary[data-directory-drop-kind], .extract-summary[data-extract-drop-kind], .sidebar-mode-btn[data-sidebar-drop-kind], #extract-panel, #sidebar");
+    let hovered = hoveredNode;
+    const isInsideSidebar = rawHoveredNode instanceof HTMLElement && Boolean(rawHoveredNode.closest("#sidebar"));
     clearBookmarkSelectionDropzones();
+    if (
+        bookmarkSelectionDragState &&
+        bookmarkSelectionDragState.dragKind === "recent-filter" &&
+        isInsideSidebar
+    ) {
+        document.getElementById("sidebar")?.classList.add("is-drag-over");
+        if (sidebarMode === "threads") {
+            const threadPanel = document.getElementById("thread-list-panel");
+            threadPanel?.classList.add("is-drag-over");
+            if (threadPanel instanceof HTMLElement) {
+                threadPanel.dataset.dropLabel = "この条件でディレクトリを見る";
+            }
+        }
+        hovered = sidebarMode === "threads"
+            ? document.getElementById("sidebar-mode-threads")
+            : document.getElementById("extract-summary-dropzone");
+    } else if (
+        hoveredNode instanceof HTMLElement &&
+        hoveredNode.id === "extract-panel" &&
+        bookmarkSelectionDragState &&
+        bookmarkSelectionDragState.dragKind === "tag"
+    ) {
+        hovered = document.getElementById("extract-summary-dropzone");
+    }
     if (!hovered) {
         if (bookmarkSelectionDragState) {
             bookmarkSelectionDragState.hoverKind = "";
             bookmarkSelectionDragState.hoverTagId = "";
+            bookmarkSelectionDragState.hoverTagGroupKey = "";
             bookmarkSelectionDragState.hoverDirectoryConvIdx = "";
             bookmarkSelectionDragState.hoverDirectoryMsgIdx = "";
         }
@@ -7935,20 +8806,40 @@ function updateBookmarkSelectionDropTarget(clientX, clientY) {
     }
     if (bookmarkSelectionDragState) {
         const hoverKind = String(
-            hovered.dataset.bookmarkDropzoneKind || hovered.dataset.directoryDropKind || ""
+            hovered.dataset.bookmarkDropzoneKind || hovered.dataset.directoryDropKind || hovered.dataset.extractDropKind || hovered.dataset.sidebarDropKind || ""
         );
         const hoverTagId = String(hovered.dataset.bookmarkTagId || "");
+        const hoverTagGroupKey = String(hovered.dataset.bookmarkTagGroupKey || "");
         const hoverDirectoryConvIdx = String(hovered.dataset.directoryConvIdx || "");
         const hoverDirectoryMsgIdx = String(hovered.dataset.directoryMsgIdx || "");
         if (isValidBookmarkDropTarget(bookmarkSelectionDragState.dragKind, hoverKind)) {
             hovered.classList.add("is-drag-over");
+            if (hoverKind === "extract-summary" && hovered instanceof HTMLElement) {
+                hovered.dataset.dropLabel = bookmarkSelectionDragState.dragKind === "recent-filter"
+                    ? "履歴を適用"
+                    : "Tag を追加";
+            } else if (hoverKind === "directory-mode" && hovered instanceof HTMLElement) {
+                hovered.dataset.dropLabel = "この条件でディレクトリを見る";
+            } else if (hoverKind === "remove-tag" && hovered instanceof HTMLElement) {
+                hovered.dataset.dropLabel = bookmarkSelectionDragState.dragKind === "tag"
+                    ? "タグを解除"
+                    : "ここにドロップでタグ解除";
+            } else if (hovered instanceof HTMLElement && bookmarkSelectionDragState.dragKind === "tag") {
+                if (hoverKind === "assign-tag" && hoverTagId && hoverTagId !== String(bookmarkSelectionDragState.tagId || "")) {
+                    hovered.dataset.dropLabel = "結合 作成";
+                } else if (hoverKind === "compound-tag-group" && hoverTagGroupKey) {
+                    hovered.dataset.dropLabel = "結合 追加";
+                }
+            }
             bookmarkSelectionDragState.hoverKind = hoverKind;
             bookmarkSelectionDragState.hoverTagId = hoverTagId;
+            bookmarkSelectionDragState.hoverTagGroupKey = hoverTagGroupKey;
             bookmarkSelectionDragState.hoverDirectoryConvIdx = hoverDirectoryConvIdx;
             bookmarkSelectionDragState.hoverDirectoryMsgIdx = hoverDirectoryMsgIdx;
         } else {
             bookmarkSelectionDragState.hoverKind = "";
             bookmarkSelectionDragState.hoverTagId = "";
+            bookmarkSelectionDragState.hoverTagGroupKey = "";
             bookmarkSelectionDragState.hoverDirectoryConvIdx = "";
             bookmarkSelectionDragState.hoverDirectoryMsgIdx = "";
         }
@@ -7977,6 +8868,8 @@ function handleBookmarkSelectionPointerMove(event) {
             ensureBookmarkSelectionDragGhost(`${bookmarkSelectionDragState.selectedKeys.length}件のprompt`);
         } else if (bookmarkSelectionDragState.dragKind === "directory-folder") {
             ensureBookmarkSelectionDragGhost("このフォルダのprompt");
+        } else if (bookmarkSelectionDragState.dragKind === "recent-filter") {
+            ensureBookmarkSelectionDragGhost(`履歴「${bookmarkSelectionDragState.filterLabel || ""}」`);
         } else if (bookmarkSelectionDragState.dragKind === "tag-remove-tool") {
             ensureBookmarkSelectionDragGhost("タグ解除");
         } else {
@@ -8008,6 +8901,7 @@ async function handleBookmarkSelectionPointerUp(event) {
         : [];
     const hoverKind = bookmarkSelectionDragState.hoverKind;
     const hoverTagId = bookmarkSelectionDragState.hoverTagId;
+    const hoverTagGroupKey = bookmarkSelectionDragState.hoverTagGroupKey;
     const hoverDirectoryConvIdx = Number.parseInt(bookmarkSelectionDragState.hoverDirectoryConvIdx || "", 10);
     const hoverDirectoryMsgIdx = Number.parseInt(bookmarkSelectionDragState.hoverDirectoryMsgIdx || "", 10);
     finishStarredPromptDrag(event);
@@ -8036,6 +8930,38 @@ async function handleBookmarkSelectionPointerUp(event) {
         if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
             renderActiveTab();
         }
+        return;
+    }
+    if (dragKind === "tag" && hoverKind === "assign-tag" && hoverTagId && hoverTagId !== dragTagId) {
+        const combinedIds = new Set([String(dragTagId || "").trim(), String(hoverTagId || "").trim()]);
+        const dragGroup = getSelectedExtractBookmarkTagGroupByTagId(dragTagId);
+        const hoverGroup = getSelectedExtractBookmarkTagGroupByTagId(hoverTagId);
+        (dragGroup?.tagIds || []).forEach((tagId) => combinedIds.add(String(tagId)));
+        (hoverGroup?.tagIds || []).forEach((tagId) => combinedIds.add(String(tagId)));
+        createBookmarkTagGroupFromTagIds(Array.from(combinedIds));
+        return;
+    }
+    if (dragKind === "tag" && hoverKind === "compound-tag-group" && hoverTagGroupKey) {
+        const targetGroup = getBookmarkTagGroupEntries().find((group) => group.id === String(hoverTagGroupKey || ""));
+        if (targetGroup) {
+            createBookmarkTagGroupFromTagIds([...targetGroup.tagIds, dragTagId]);
+        }
+        return;
+    }
+    if (dragKind === "tag" && hoverKind === "extract-summary") {
+        addTagToExtractFilters(dragTagId);
+        if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+            renderActiveTab();
+        }
+        return;
+    }
+    if (dragKind === "recent-filter" && hoverKind === "extract-summary") {
+        applyRecentFilterPayloadToExtractSummary(dragState.filterPayload || "");
+        return;
+    }
+    if (dragKind === "recent-filter" && hoverKind === "directory-mode") {
+        await applyStoredFilterToDirectory(dragState.filterPayload || "");
+        showToast("履歴の条件でディレクトリを絞り込んだよ");
         return;
     }
     if (dragKind === "tag" && hoverKind === "directory-prompt" && Number.isInteger(hoverDirectoryConvIdx) && Number.isInteger(hoverDirectoryMsgIdx)) {
@@ -8368,13 +9294,9 @@ function toggleBookmarkTagFilter(tagId, event) {
     event?.stopPropagation?.();
     const normalizedTagId = String(tagId || "").trim();
     if (!normalizedTagId) return;
-    const nextIds = new Set((selectedBookmarkTagFilterIds || []).map((id) => String(id)));
-    if (nextIds.has(normalizedTagId)) {
-        nextIds.delete(normalizedTagId);
-    } else {
-        nextIds.add(normalizedTagId);
-    }
-    selectedBookmarkTagFilterIds = Array.from(nextIds);
+    const tag = getBookmarkTagById(normalizedTagId);
+    if (!tag) return;
+    toggleExtractBookmarkTag(String(tag.name || "").trim(), event);
     if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
         renderActiveTab();
     }
@@ -8383,8 +9305,13 @@ function toggleBookmarkTagFilter(tagId, event) {
 function clearBookmarkTagFilters(event) {
     event?.preventDefault?.();
     event?.stopPropagation?.();
-    if (!selectedBookmarkTagFilterIds.length) return;
-    selectedBookmarkTagFilterIds = [];
+    if (!selectedBookmarkTagFilterIds.length && !getSelectedExtractBookmarkTagGroups().length) return;
+    writeExtractMultiValue("extract-bookmark-tags", []);
+    writeExtractGroupValue("extract-bookmark-tag-groups", []);
+    renderExtractBookmarkTagMenu();
+    syncExtractBookmarkTagTrigger();
+    syncBookmarkWorkspaceFiltersFromExtract();
+    scheduleVirtualThreadPreview();
     if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
         renderActiveTab();
     }
@@ -8652,6 +9579,9 @@ function buildSavedViewDraftName(filters) {
     if (Array.isArray(nextFilters.bookmarkTags) && nextFilters.bookmarkTags.length > 0) {
         return `tag: ${nextFilters.bookmarkTags[0]}`;
     }
+    if (Array.isArray(nextFilters.bookmarkTagGroups) && nextFilters.bookmarkTagGroups.length > 0) {
+        return `tag: ${normalizeBookmarkTagNameGroup(nextFilters.bookmarkTagGroups[0]).join(" & ")}`;
+    }
     if (String(nextFilters.dateFrom || "").trim() || String(nextFilters.dateTo || "").trim()) {
         return `${nextFilters.dateFrom || "..."} -> ${nextFilters.dateTo || "..."}`;
     }
@@ -8847,6 +9777,7 @@ function hasActiveExtractFilters(filters) {
         (filters.service && filters.service.length) ||
         (filters.model && filters.model.length) ||
         (filters.bookmarkTags && filters.bookmarkTags.length) ||
+        (filters.bookmarkTagGroups && filters.bookmarkTagGroups.length) ||
         EXTRACT_TEXT_FILTER_SPECS.some(({ key }) => String(filters[key] || "").trim()) ||
         normalizeBookmarkedFilterValue(filters.bookmarked) !== "all"
     );
@@ -8948,6 +9879,7 @@ function clearVirtualThreadFilters() {
     writeExtractMultiValue("extract-service", []);
     writeExtractMultiValue("extract-model", []);
     writeExtractMultiValue("extract-bookmark-tags", []);
+    writeExtractGroupValue("extract-bookmark-tag-groups", []);
     appliedExtractConversationIds = null;
     markTreeStructureDirty();
     syncExtractServiceButtons();
@@ -8955,6 +9887,8 @@ function clearVirtualThreadFilters() {
     syncExtractModelTrigger();
     renderExtractBookmarkTagMenu();
     syncExtractBookmarkTagTrigger();
+    syncBookmarkWorkspaceFiltersFromExtract();
+    rerenderBookmarkManagerIfActive();
     syncExtractSortButton();
     closeExtractModelMenu();
     closeExtractBookmarkTagMenu();
@@ -9594,6 +10528,11 @@ function renderVirtualThreadTab(tab) {
     (filters.bookmarkTags || []).forEach((value) => {
         chips.push(`<span class="extract-chip">tag: ${escapeHTML(value)}</span>`);
     });
+    (filters.bookmarkTagGroups || []).forEach((group) => {
+        const label = normalizeBookmarkTagNameGroup(group).join(" & ");
+        if (!label) return;
+        chips.push(`<span class="extract-chip extract-chip-compound">tag: ${escapeHTML(label)}</span>`);
+    });
     [
         ["dateFrom", "from"],
         ["dateTo", "to"],
@@ -9743,6 +10682,7 @@ function renderManagerTab(tab) {
     refreshUtilityToggleButtons();
     updateToolbarCollapse();
     if (tab.kind === "starred_prompts") {
+        renderRecentFilters();
         syncStarredPromptSelectionClasses({ pruneToVisible: true });
     }
 }
@@ -10332,6 +11272,7 @@ async function bootViewer(options = {}) {
         isMatchFilterActive = readBooleanPreference(STORAGE_KEYS.matchFilter, false);
         isSidebarHidden = readBooleanPreference(STORAGE_KEYS.sidebarHidden, false);
         sidebarMode = localStorage.getItem(STORAGE_KEYS.sidebarMode) || "threads";
+        applySidebarWidth(localStorage.getItem(STORAGE_KEYS.sidebarWidth) || 292);
 
         setupObserver();
         if (viewer) {
@@ -10355,6 +11296,7 @@ async function bootViewer(options = {}) {
         ensureNativeShortcutFallbacks();
         ensureTabSessionLifecyclePersistence();
         ensureReadingContextWidgetFocusBridges();
+        ensureSidebarResizer();
         debugPerfLog("boot:before-filter-options");
         populateExtractOptions(await requestFilterOptions());
         debugPerfLog("boot:after-filter-options");
