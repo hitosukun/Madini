@@ -201,6 +201,63 @@ def _ensure_bookmark_tables(cursor):
         ON bookmarks(target_type, updated_at DESC, created_at DESC)
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bookmark_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            system_key TEXT,
+            is_system INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    existing_columns = {
+        row[1]
+        for row in cursor.execute("PRAGMA table_info(bookmark_tags)").fetchall()
+    }
+    if "system_key" not in existing_columns:
+        try:
+            cursor.execute("ALTER TABLE bookmark_tags ADD COLUMN system_key TEXT")
+        except sqlite3.OperationalError:
+            pass
+    if "is_system" not in existing_columns:
+        try:
+            cursor.execute("ALTER TABLE bookmark_tags ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bookmark_tag_links (
+            bookmark_id INTEGER NOT NULL,
+            tag_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (bookmark_id, tag_id),
+            FOREIGN KEY(bookmark_id) REFERENCES bookmarks(id),
+            FOREIGN KEY(tag_id) REFERENCES bookmark_tags(id)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_bookmark_tag_links_tag
+        ON bookmark_tag_links(tag_id, bookmark_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_bookmark_tag_links_bookmark
+        ON bookmark_tag_links(bookmark_id, tag_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bookmark_tags_system_key
+        ON bookmark_tags(system_key)
+        WHERE system_key IS NOT NULL
+        """
+    )
 
 
 def _get_conversation_columns(cursor):
@@ -1047,6 +1104,7 @@ def _normalize_virtual_thread_filters(filters):
     services = _normalize_filter_values(filters.get("service"))
     models = _normalize_filter_values(filters.get("model"))
     roles = _normalize_filter_values(filters.get("role"))
+    bookmark_tags = _normalize_filter_values(filters.get("bookmarkTags"))
     date_from = str(filters.get("dateFrom") or "").strip()
     date_to = str(filters.get("dateTo") or "").strip()
     title_contains = str(filters.get("titleContains") or "").strip()
@@ -1062,6 +1120,8 @@ def _normalize_virtual_thread_filters(filters):
         normalized["model"] = models
     if roles:
         normalized["role"] = roles
+    if bookmark_tags:
+        normalized["bookmarkTags"] = bookmark_tags
     if date_from:
         normalized["dateFrom"] = date_from
     if date_to:
@@ -1087,6 +1147,7 @@ def _has_meaningful_virtual_thread_filters(filters):
             filters.get("service"),
             filters.get("model"),
             filters.get("role"),
+            filters.get("bookmarkTags"),
             filters.get("dateFrom"),
             filters.get("dateTo"),
             filters.get("titleContains"),
@@ -1105,6 +1166,7 @@ def _build_filter_history_label(filters):
     services = filters.get("service") or []
     models = filters.get("model") or []
     roles = filters.get("role") or []
+    bookmark_tags = filters.get("bookmarkTags") or []
     if services:
         parts.append(f"service={'+'.join(services)}")
     if models:
@@ -1119,6 +1181,8 @@ def _build_filter_history_label(filters):
         parts.append(f"response={filters['responseContains']}")
     if roles:
         parts.append(f"role={'+'.join(roles)}")
+    if bookmark_tags:
+        parts.append(f"tags={'+'.join(bookmark_tags)}")
     if filters.get("sourceFile"):
         parts.append(f"file={filters['sourceFile']}")
     if filters.get("bookmarked") == "bookmarked":
@@ -1202,7 +1266,7 @@ def delete_starred_filter(
 def list_saved_filters(
     kind="recent",
     target_type="virtual_thread",
-    limit=20,
+    limit=10,
     db_file=DB_FILE,
 ):
     if not db_file.exists():
@@ -1224,7 +1288,7 @@ def list_saved_filters(
         ORDER BY last_used_at DESC, created_at DESC, id DESC
         LIMIT ?
         """,
-        (kind, target_type, max(1, int(limit or 20))),
+        (kind, target_type, max(1, int(limit or 10))),
     ).fetchall()
     conn.close()
     return [_decode_filter_history_row(row) for row in rows]
@@ -1234,7 +1298,7 @@ def save_recent_filter(
     filters,
     kind="recent",
     target_type="virtual_thread",
-    limit=20,
+    limit=10,
     db_file=DB_FILE,
 ):
     normalized_filters = _normalize_virtual_thread_filters(filters)
@@ -1308,7 +1372,7 @@ def save_recent_filter(
         """,
         (kind, target_type),
     ).fetchall()
-    overflow_ids = [row["id"] for row in rows[max(1, int(limit or 20)) :]]
+    overflow_ids = [row["id"] for row in rows[max(1, int(limit or 10)) :]]
     if overflow_ids:
         cursor.executemany(
             "DELETE FROM saved_filters WHERE id = ?",
@@ -1499,65 +1563,11 @@ def _build_bookmark_state_response(target_type, target_id, payload=None, bookmar
     }
 
 
-def set_bookmark(target_type, target_id, bookmarked, payload=None, db_file=DB_FILE):
-    # Thread bookmarks are the only active UI today, but the DB boundary stays
-    # generic so prompt/answer/saved-view targets can reuse the same write path.
-    normalized_target_type, normalized_target_id, payload_dict = (
-        _normalize_bookmark_target_spec(target_type, target_id, payload)
-    )
-    if not normalized_target_type or not normalized_target_id:
-        return {"bookmarked": False}
-
-    ensure_user_data_dir()
-    conn = init_db(db_file)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    timestamp = _current_timestamp()
-
-    if bookmarked:
-        cursor.execute(
-            """
-            INSERT INTO bookmarks (
-                target_type, target_id, payload_json, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(target_type, target_id)
-            DO UPDATE SET
-                payload_json = excluded.payload_json,
-                updated_at = excluded.updated_at
-            """,
-            (
-                normalized_target_type,
-                normalized_target_id,
-                json.dumps(payload_dict, ensure_ascii=False, sort_keys=True),
-                timestamp,
-                timestamp,
-            ),
-        )
-    else:
-        cursor.execute(
-            """
-            DELETE FROM bookmarks
-            WHERE target_type = ?
-              AND target_id = ?
-            """,
-            (normalized_target_type, normalized_target_id),
-        )
-
-    conn.commit()
-    conn.close()
-    return _build_bookmark_state_response(
-        normalized_target_type,
-        normalized_target_id,
-        payload=payload_dict,
-        bookmarked=bookmarked,
-        updated_at=timestamp,
-    )
+BOOKMARK_LABEL_KIND_BOOKMARK = "bookmark"
+BOOKMARK_LABEL_KIND_TAG = "tag"
 
 
-def fetch_bookmark_states(target_specs, db_file=DB_FILE):
-    # Generic read boundary for currently visible bookmark targets. Broader bookmark
-    # listing/filtering still expands target type by target type on top of this.
+def _normalize_bookmark_target_specs(target_specs):
     normalized_specs = []
     for spec in target_specs or []:
         if not isinstance(spec, dict):
@@ -1578,7 +1588,268 @@ def fetch_bookmark_states(target_specs, db_file=DB_FILE):
                 "payload": payload_dict,
             }
         )
+    return normalized_specs
 
+
+def _bookmark_row_has_any_tags(cursor, bookmark_id):
+    row = cursor.execute(
+        """
+        SELECT 1
+        FROM bookmark_tag_links
+        WHERE bookmark_id = ?
+        LIMIT 1
+        """,
+        (bookmark_id,),
+    ).fetchone()
+    return bool(row)
+
+
+def _resolve_runtime_bookmark_state(cursor, target_type, target_id, payload=None):
+    normalized_target_type, normalized_target_id, payload_dict = (
+        _normalize_bookmark_target_spec(target_type, target_id, payload)
+    )
+    row = cursor.execute(
+        """
+        SELECT id, payload_json, updated_at
+        FROM bookmarks
+        WHERE target_type = ?
+          AND target_id = ?
+        """,
+        (normalized_target_type, normalized_target_id),
+    ).fetchone()
+    if not row:
+        return _build_bookmark_state_response(
+            normalized_target_type,
+            normalized_target_id,
+            payload=payload_dict,
+            bookmarked=False,
+        )
+    try:
+        stored_payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        stored_payload = {}
+    has_tags = _bookmark_row_has_any_tags(cursor, row["id"])
+    is_active = True
+    if normalized_target_type == "prompt":
+        is_active = has_tags
+    return _build_bookmark_state_response(
+        normalized_target_type,
+        normalized_target_id,
+        payload=stored_payload or payload_dict,
+        bookmarked=is_active,
+        updated_at=row["updated_at"],
+    )
+
+
+def _set_primary_bookmark_membership(cursor, target_specs, assigned, timestamp):
+    normalized_specs = _normalize_bookmark_target_specs(target_specs)
+    if not normalized_specs:
+        return {"labelKind": BOOKMARK_LABEL_KIND_BOOKMARK, "assigned": bool(assigned), "affected": 0}
+
+    affected = 0
+    if assigned:
+        for spec in normalized_specs:
+            cursor.execute(
+                """
+                INSERT INTO bookmarks (
+                    target_type, target_id, payload_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(target_type, target_id)
+                DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    spec["targetType"],
+                    spec["targetId"],
+                    json.dumps(spec["payload"], ensure_ascii=False, sort_keys=True),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            affected += 1
+    else:
+        for spec in normalized_specs:
+            row = cursor.execute(
+                """
+                SELECT id
+                FROM bookmarks
+                WHERE target_type = ?
+                  AND target_id = ?
+                """,
+                (spec["targetType"], spec["targetId"]),
+            ).fetchone()
+            if row and spec["targetType"] == "prompt" and _bookmark_row_has_any_tags(cursor, row["id"]):
+                continue
+            if row:
+                cursor.execute(
+                    """
+                    DELETE FROM bookmark_tag_links
+                    WHERE bookmark_id = ?
+                    """,
+                    (row["id"],),
+                )
+            cursor.execute(
+                """
+                DELETE FROM bookmarks
+                WHERE target_type = ?
+                  AND target_id = ?
+                """,
+                (spec["targetType"], spec["targetId"]),
+            )
+            affected += cursor.rowcount
+
+    return {
+        "labelKind": BOOKMARK_LABEL_KIND_BOOKMARK,
+        "assigned": bool(assigned),
+        "affected": affected,
+        "updatedAt": timestamp,
+    }
+
+
+def _fetch_bookmark_label_row(cursor, label_id):
+    if label_id is None or str(label_id).strip() == "":
+        return None
+    try:
+        normalized_label_id = int(label_id)
+    except (TypeError, ValueError):
+        return None
+    return cursor.execute(
+        """
+        SELECT id, name, system_key, is_system, created_at, updated_at
+        FROM bookmark_tags
+        WHERE id = ?
+        """,
+        (normalized_label_id,),
+    ).fetchone()
+
+
+def _set_tag_bookmark_membership(cursor, label_id, target_specs, assigned, timestamp):
+    tag_row = _fetch_bookmark_label_row(cursor, label_id)
+    if not tag_row:
+        return {"labelKind": BOOKMARK_LABEL_KIND_TAG, "labelId": None, "assigned": bool(assigned), "affected": 0}
+
+    bookmark_rows = _resolve_bookmark_rows_for_targets(cursor, target_specs)
+    if not bookmark_rows:
+        return {
+            "labelKind": BOOKMARK_LABEL_KIND_TAG,
+            "labelId": tag_row["id"],
+            "labelName": tag_row["name"],
+            "assigned": bool(assigned),
+            "affected": 0,
+        }
+
+    affected = 0
+    if assigned:
+        for row in bookmark_rows:
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO bookmark_tag_links (bookmark_id, tag_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (row["id"], tag_row["id"], timestamp),
+            )
+            if cursor.rowcount > 0:
+                affected += 1
+    else:
+        for row in bookmark_rows:
+            cursor.execute(
+                """
+                DELETE FROM bookmark_tag_links
+                WHERE bookmark_id = ?
+                  AND tag_id = ?
+                """,
+                (row["id"], tag_row["id"]),
+            )
+            affected += cursor.rowcount
+            if row["target_type"] == "prompt" and not _bookmark_row_has_any_tags(cursor, row["id"]):
+                cursor.execute(
+                    """
+                    DELETE FROM bookmarks
+                    WHERE id = ?
+                    """,
+                    (row["id"],),
+                )
+
+    cursor.execute(
+        """
+        UPDATE bookmark_tags
+        SET updated_at = ?
+        WHERE id = ?
+        """,
+        (timestamp, tag_row["id"]),
+    )
+    return {
+        "labelKind": BOOKMARK_LABEL_KIND_TAG,
+        "labelId": tag_row["id"],
+        "labelName": tag_row["name"],
+        "assigned": bool(assigned),
+        "affected": affected,
+        "updatedAt": timestamp,
+    }
+
+
+def set_bookmark_label_membership(label_kind, target_specs, assigned, label_id=None, db_file=DB_FILE):
+    normalized_label_kind = str(label_kind or "").strip().lower()
+    if normalized_label_kind not in {BOOKMARK_LABEL_KIND_BOOKMARK, BOOKMARK_LABEL_KIND_TAG}:
+        return {"labelKind": normalized_label_kind or None, "assigned": bool(assigned), "affected": 0}
+
+    ensure_user_data_dir()
+    conn = init_db(db_file)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    timestamp = _current_timestamp()
+
+    if normalized_label_kind == BOOKMARK_LABEL_KIND_BOOKMARK:
+        result = _set_primary_bookmark_membership(cursor, target_specs, assigned, timestamp)
+    else:
+        result = _set_tag_bookmark_membership(cursor, label_id, target_specs, assigned, timestamp)
+
+    conn.commit()
+    conn.close()
+    return result
+
+
+def set_bookmark(target_type, target_id, bookmarked, payload=None, db_file=DB_FILE):
+    # Thread bookmarks are the only active UI today, but the DB boundary stays
+    # generic so prompt/answer/saved-view targets can reuse the same write path.
+    normalized_target_type, normalized_target_id, payload_dict = (
+        _normalize_bookmark_target_spec(target_type, target_id, payload)
+    )
+    if not normalized_target_type or not normalized_target_id:
+        return {"bookmarked": False}
+    result = set_bookmark_label_membership(
+        BOOKMARK_LABEL_KIND_BOOKMARK,
+        [
+            {
+                "targetType": normalized_target_type,
+                "targetId": normalized_target_id,
+                "payload": payload_dict,
+            }
+        ],
+        bookmarked,
+        db_file=db_file,
+    )
+    conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    final_state = _resolve_runtime_bookmark_state(
+        cursor,
+        normalized_target_type,
+        normalized_target_id,
+        payload=payload_dict,
+    )
+    conn.close()
+    if final_state.get("updatedAt") is None:
+        final_state["updatedAt"] = result.get("updatedAt")
+    return final_state
+
+
+def fetch_bookmark_states(target_specs, db_file=DB_FILE):
+    # Generic read boundary for currently visible bookmark targets. Broader bookmark
+    # listing/filtering still expands target type by target type on top of this.
+    normalized_specs = _normalize_bookmark_target_specs(target_specs)
     if not normalized_specs:
         return []
     if not db_file.exists():
@@ -1609,38 +1880,14 @@ def fetch_bookmark_states(target_specs, db_file=DB_FILE):
 
     states = []
     for spec in normalized_specs:
-        row = cursor.execute(
-            """
-            SELECT payload_json, updated_at
-            FROM bookmarks
-            WHERE target_type = ?
-              AND target_id = ?
-            """,
-            (spec["targetType"], spec["targetId"]),
-        ).fetchone()
-        if row:
-            try:
-                stored_payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
-            except (TypeError, json.JSONDecodeError):
-                stored_payload = {}
-            states.append(
-                _build_bookmark_state_response(
-                    spec["targetType"],
-                    spec["targetId"],
-                    payload=stored_payload or spec["payload"],
-                    bookmarked=True,
-                    updated_at=row["updated_at"],
-                )
+        states.append(
+            _resolve_runtime_bookmark_state(
+                cursor,
+                spec["targetType"],
+                spec["targetId"],
+                payload=spec["payload"],
             )
-        else:
-            states.append(
-                _build_bookmark_state_response(
-                    spec["targetType"],
-                    spec["targetId"],
-                    payload=spec["payload"],
-                    bookmarked=False,
-                )
-            )
+        )
     conn.close()
     return states
 
@@ -1664,6 +1911,7 @@ def _build_bookmark_list_entry(row):
     )
 
     return {
+        "bookmarkId": row["id"],
         "targetType": row["target_type"],
         "targetId": row["target_id"],
         "payload": payload,
@@ -1671,6 +1919,7 @@ def _build_bookmark_list_entry(row):
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
         "label": label,
+        "tags": row["tags"] if isinstance(row["tags"], list) else [],
     }
 
 
@@ -1685,6 +1934,42 @@ def _split_prompt_bookmark_target_id(target_id):
     if message_index < 0:
         return "", None
     return conv_id, message_index
+
+
+def _fetch_bookmark_tag_map(cursor, bookmark_ids):
+    normalized_ids = [
+        int(bookmark_id)
+        for bookmark_id in (bookmark_ids or [])
+        if isinstance(bookmark_id, int) or str(bookmark_id).isdigit()
+    ]
+    if not normalized_ids or not _table_exists(cursor, "bookmark_tags") or not _table_exists(cursor, "bookmark_tag_links"):
+        return {}
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    rows = cursor.execute(
+        f"""
+        SELECT l.bookmark_id, t.id AS tag_id, t.name AS tag_name
+             , t.system_key AS system_key
+             , t.is_system AS is_system
+        FROM bookmark_tag_links l
+        JOIN bookmark_tags t ON t.id = l.tag_id
+        WHERE l.bookmark_id IN ({placeholders})
+        ORDER BY LOWER(t.name) ASC, t.id ASC
+        """,
+        normalized_ids,
+    ).fetchall()
+    tag_map = defaultdict(list)
+    for row in rows:
+        if row["is_system"]:
+            continue
+        tag_map[row["bookmark_id"]].append(
+            {
+                "id": row["tag_id"],
+                "name": row["tag_name"],
+                "systemKey": row["system_key"],
+                "isSystem": bool(row["is_system"]),
+            }
+        )
+    return tag_map
 
 
 def list_bookmarks(db_file=DB_FILE):
@@ -1702,13 +1987,22 @@ def list_bookmarks(db_file=DB_FILE):
 
     rows = cursor.execute(
         """
-        SELECT target_type, target_id, payload_json, created_at, updated_at
+        SELECT id, target_type, target_id, payload_json, created_at, updated_at
         FROM bookmarks
         ORDER BY updated_at DESC, created_at DESC, target_type ASC, target_id ASC
         """
     ).fetchall()
+    tag_map = _fetch_bookmark_tag_map(cursor, [row["id"] for row in rows])
     conn.close()
-    return [_build_bookmark_list_entry(row) for row in rows]
+    return [
+        _build_bookmark_list_entry(
+            {
+                **dict(row),
+                "tags": tag_map.get(row["id"], []),
+            }
+        )
+        for row in rows
+    ]
 
 
 def list_starred_prompts(limit=500, db_file=DB_FILE):
@@ -1720,20 +2014,29 @@ def list_starred_prompts(limit=500, db_file=DB_FILE):
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    if not _table_exists(cursor, "bookmarks"):
+    if (
+        not _table_exists(cursor, "bookmarks")
+        or not _table_exists(cursor, "bookmark_tag_links")
+    ):
         conn.close()
         return []
 
     rows = cursor.execute(
         """
-        SELECT target_type, target_id, payload_json, created_at, updated_at
+        SELECT id, target_type, target_id, payload_json, created_at, updated_at
         FROM bookmarks
         WHERE target_type = 'prompt'
+          AND EXISTS (
+              SELECT 1
+              FROM bookmark_tag_links l
+              WHERE l.bookmark_id = bookmarks.id
+          )
         ORDER BY updated_at DESC, created_at DESC, target_id DESC
         LIMIT ?
         """,
         (max(1, int(limit or 500)),),
     ).fetchall()
+    tag_map = _fetch_bookmark_tag_map(cursor, [row["id"] for row in rows])
 
     conversation_ids = []
     parsed_rows = []
@@ -1780,6 +2083,7 @@ def list_starred_prompts(limit=500, db_file=DB_FILE):
         entries.append(
             {
                 "targetType": "prompt",
+                "bookmarkId": row["id"],
                 "targetId": row["target_id"],
                 "parentConversationId": conv_id,
                 "messageIndex": message_index,
@@ -1794,9 +2098,201 @@ def list_starred_prompts(limit=500, db_file=DB_FILE):
                 "bookmarked": True,
                 "createdAt": row["created_at"],
                 "updatedAt": row["updated_at"],
+                "tags": tag_map.get(row["id"], []),
             }
         )
     return entries
+
+
+def create_bookmark_label(name, db_file=DB_FILE):
+    normalized_name = str(name or "").strip()
+    if not normalized_name:
+        return None
+
+    ensure_user_data_dir()
+    conn = init_db(db_file)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    timestamp = _current_timestamp()
+    cursor.execute(
+        """
+        INSERT INTO bookmark_tags (name, created_at, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(name)
+        DO UPDATE SET updated_at = bookmark_tags.updated_at
+        """,
+        (normalized_name, timestamp, timestamp),
+    )
+    row = cursor.execute(
+        """
+        SELECT id, name, system_key, is_system, created_at, updated_at
+        FROM bookmark_tags
+        WHERE name = ?
+        """,
+        (normalized_name,),
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "systemKey": row["system_key"],
+        "isSystem": bool(row["is_system"]),
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "bookmarkCount": 0,
+    }
+
+
+def create_bookmark_tag(name, db_file=DB_FILE):
+    return create_bookmark_label(name, db_file=db_file)
+
+
+def list_bookmark_labels(db_file=DB_FILE, include_system=False):
+    ensure_user_data_dir()
+    if not db_file.exists():
+        return []
+
+    conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if not _table_exists(cursor, "bookmark_tags"):
+        conn.close()
+        return []
+
+    rows = cursor.execute(
+        """
+        SELECT
+            t.id,
+            t.name,
+            t.system_key,
+            t.is_system,
+            t.created_at,
+            t.updated_at,
+            COUNT(l.bookmark_id) AS bookmark_count
+        FROM bookmark_tags t
+        LEFT JOIN bookmark_tag_links l ON l.tag_id = t.id
+        GROUP BY t.id, t.name, t.system_key, t.is_system, t.created_at, t.updated_at
+        ORDER BY t.is_system ASC, LOWER(t.name) ASC, t.id ASC
+        """
+    ).fetchall()
+    conn.close()
+    tags = [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "systemKey": row["system_key"],
+            "isSystem": bool(row["is_system"]),
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+            "bookmarkCount": row["bookmark_count"] or 0,
+        }
+        for row in rows
+    ]
+    if include_system:
+        return tags
+    return [tag for tag in tags if not tag["isSystem"]]
+
+
+def list_bookmark_tags(db_file=DB_FILE, include_system=False):
+    return list_bookmark_labels(db_file=db_file, include_system=include_system)
+
+
+def _resolve_bookmark_rows_for_targets(cursor, target_specs):
+    normalized_specs = _normalize_bookmark_target_specs(target_specs)
+
+    resolved_rows = []
+    for spec in normalized_specs:
+        row = cursor.execute(
+            """
+            SELECT id, target_type, target_id
+            FROM bookmarks
+            WHERE target_type = ?
+              AND target_id = ?
+            """,
+            (spec["targetType"], spec["targetId"]),
+        ).fetchone()
+        if row:
+            resolved_rows.append(row)
+    return resolved_rows
+
+
+def set_bookmark_tag_membership(tag_id, target_specs, assigned, db_file=DB_FILE):
+    result = set_bookmark_label_membership(
+        BOOKMARK_LABEL_KIND_TAG,
+        target_specs,
+        assigned,
+        label_id=tag_id,
+        db_file=db_file,
+    )
+    return {
+        "tagId": result.get("labelId"),
+        "tagName": result.get("labelName"),
+        "assigned": bool(assigned),
+        "affected": result.get("affected", 0),
+    }
+
+
+def delete_bookmark_label(label_id, db_file=DB_FILE):
+    if label_id is None or str(label_id).strip() == "":
+        return {"deleted": 0}
+
+    ensure_user_data_dir()
+    if not db_file.exists():
+        return {"deleted": 0}
+
+    conn = init_db(db_file)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    label_row = cursor.execute(
+        """
+        SELECT id
+        FROM bookmark_tags
+        WHERE id = ?
+          AND COALESCE(is_system, 0) = 0
+        """,
+        (int(label_id),),
+    ).fetchone()
+    if not label_row:
+        conn.close()
+        return {"deleted": 0}
+
+    cursor.execute(
+        """
+        DELETE FROM bookmark_tag_links
+        WHERE tag_id = ?
+        """,
+        (label_row["id"],),
+    )
+    cursor.execute(
+        """
+        DELETE FROM bookmark_tags
+        WHERE id = ?
+        """,
+        (label_row["id"],),
+    )
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return {"deleted": deleted}
+
+
+def delete_bookmark_tag(tag_id, db_file=DB_FILE):
+    return delete_bookmark_label(tag_id, db_file=db_file)
+
+
+def delete_bookmarks(target_specs, db_file=DB_FILE):
+    result = set_bookmark_label_membership(
+        BOOKMARK_LABEL_KIND_BOOKMARK,
+        target_specs,
+        False,
+        db_file=db_file,
+    )
+    return {"deleted": result.get("affected", 0)}
+
+
 
 
 def _fetch_bookmarked_target_ids(cursor, target_type):
@@ -1822,14 +2318,18 @@ def _fetch_bookmarked_thread_ids(cursor):
 
 
 def _fetch_starred_prompt_counts(cursor):
-    if not _table_exists(cursor, "bookmarks"):
+    if (
+        not _table_exists(cursor, "bookmarks")
+        or not _table_exists(cursor, "bookmark_tag_links")
+    ):
         return {}
     counts = defaultdict(int)
     for row in cursor.execute(
         """
-        SELECT target_id
-        FROM bookmarks
-        WHERE target_type = 'prompt'
+        SELECT DISTINCT b.id, b.target_id
+        FROM bookmarks b
+        JOIN bookmark_tag_links l ON l.bookmark_id = b.id
+        WHERE b.target_type = 'prompt'
         """
     ).fetchall():
         conv_id, message_index = _split_prompt_bookmark_target_id(row["target_id"])
@@ -1856,6 +2356,7 @@ def _build_virtual_thread_title(filters):
         parts.append(f"service={'+'.join(services)}")
     if models:
         parts.append(f"model={'+'.join(models)}")
+    bookmark_tags = _normalize_filter_values(filters.get("bookmarkTags"))
     if date_from or date_to:
         parts.append(f"{date_from or '...'}〜{date_to or '...'}")
     if title_contains:
@@ -1866,6 +2367,8 @@ def _build_virtual_thread_title(filters):
         parts.append(f"response={response_contains}")
     if roles:
         parts.append(f"role={'+'.join(roles)}")
+    if bookmark_tags:
+        parts.append(f"tags={'+'.join(bookmark_tags)}")
     if source_file:
         parts.append(f"file={source_file}")
     if bookmarked == "bookmarked":
@@ -1878,7 +2381,68 @@ def _build_virtual_thread_title(filters):
     return "Filter Preview: " + ", ".join(parts)
 
 
-def _build_virtual_thread_where(filters, has_bookmarks_table=True, primary_time_field="primary_time"):
+def _build_bookmark_tag_exists_clause(
+    target_id_expr,
+    bookmark_tags,
+    has_bookmark_tag_tables=True,
+):
+    normalized_tags = _normalize_filter_values(bookmark_tags)
+    if not normalized_tags:
+        return "", []
+    if not has_bookmark_tag_tables:
+        return "1=0", []
+
+    placeholders = ", ".join("?" for _ in normalized_tags)
+    clause = f"""
+        EXISTS (
+            SELECT 1
+            FROM bookmarks b
+            JOIN bookmark_tag_links l ON l.bookmark_id = b.id
+            JOIN bookmark_tags t ON t.id = l.tag_id
+            WHERE b.target_type = 'prompt'
+              AND b.target_id = {target_id_expr}
+              AND LOWER(COALESCE(t.name, '')) IN ({placeholders})
+            GROUP BY b.id
+            HAVING COUNT(DISTINCT LOWER(COALESCE(t.name, ''))) = ?
+        )
+    """
+    return clause, [tag.lower() for tag in normalized_tags] + [len(normalized_tags)]
+
+
+def _build_conversation_bookmark_tag_exists_clause(
+    conversation_id_expr,
+    bookmark_tags,
+    has_bookmark_tag_tables=True,
+):
+    normalized_tags = _normalize_filter_values(bookmark_tags)
+    if not normalized_tags:
+        return "", []
+    if not has_bookmark_tag_tables:
+        return "1=0", []
+
+    placeholders = ", ".join("?" for _ in normalized_tags)
+    clause = f"""
+        EXISTS (
+            SELECT 1
+            FROM bookmarks b
+            JOIN bookmark_tag_links l ON l.bookmark_id = b.id
+            JOIN bookmark_tags t ON t.id = l.tag_id
+            WHERE b.target_type = 'prompt'
+              AND substr(b.target_id, 1, length({conversation_id_expr}) + 1) = {conversation_id_expr} || ':'
+              AND LOWER(COALESCE(t.name, '')) IN ({placeholders})
+            GROUP BY b.id
+            HAVING COUNT(DISTINCT LOWER(COALESCE(t.name, ''))) = ?
+        )
+    """
+    return clause, [tag.lower() for tag in normalized_tags] + [len(normalized_tags)]
+
+
+def _build_virtual_thread_where(
+    filters,
+    has_bookmarks_table=True,
+    has_bookmark_tag_tables=True,
+    primary_time_field="primary_time",
+):
     clauses = []
     params = []
     used_optional_columns = set()
@@ -1888,6 +2452,7 @@ def _build_virtual_thread_where(filters, has_bookmarks_table=True, primary_time_
     models = _normalize_filter_values(filters.get("model"))
     source_file = (filters.get("sourceFile") or "").strip()
     roles = _normalize_filter_values(filters.get("role"))
+    bookmark_tags = _normalize_filter_values(filters.get("bookmarkTags"))
     date_from = (filters.get("dateFrom") or "").strip()
     date_to = (filters.get("dateTo") or "").strip()
     title_contains = (filters.get("titleContains") or "").strip()
@@ -1970,6 +2535,15 @@ def _build_virtual_thread_where(filters, has_bookmarks_table=True, primary_time_
             """
         )
 
+    if bookmark_tags:
+        clause, clause_params = _build_bookmark_tag_exists_clause(
+            "conv_id || ':' || CAST(message_index AS TEXT)",
+            bookmark_tags,
+            has_bookmark_tag_tables=has_bookmarks_table and has_bookmark_tag_tables,
+        )
+        clauses.append(clause)
+        params.extend(clause_params)
+
     where_sql = " AND ".join(clauses) if clauses else "1=1"
     return where_sql, params, used_optional_columns
 
@@ -1977,6 +2551,7 @@ def _build_virtual_thread_where(filters, has_bookmarks_table=True, primary_time_
 def _build_virtual_thread_conversation_where(
     filters,
     has_bookmarks_table=True,
+    has_bookmark_tag_tables=True,
     table_alias="c",
     primary_time_expr="",
 ):
@@ -1988,6 +2563,7 @@ def _build_virtual_thread_conversation_where(
     services = _normalize_filter_values(filters.get("service"))
     models = _normalize_filter_values(filters.get("model"))
     source_file = (filters.get("sourceFile") or "").strip()
+    bookmark_tags = _normalize_filter_values(filters.get("bookmarkTags"))
     date_from = (filters.get("dateFrom") or "").strip()
     date_to = (filters.get("dateTo") or "").strip()
     title_contains = (filters.get("titleContains") or "").strip()
@@ -2057,6 +2633,15 @@ def _build_virtual_thread_conversation_where(
             """
         )
 
+    if bookmark_tags:
+        clause, clause_params = _build_conversation_bookmark_tag_exists_clause(
+            f"{table_alias}.id",
+            bookmark_tags,
+            has_bookmark_tag_tables=has_bookmarks_table and has_bookmark_tag_tables,
+        )
+        clauses.append(clause)
+        params.extend(clause_params)
+
     where_sql = " AND ".join(clauses) if clauses else "1=1"
     return where_sql, params, used_optional_columns
 
@@ -2074,12 +2659,19 @@ def build_virtual_thread_preview(filters, db_file=DB_FILE):
     conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
+    has_bookmarks_table = _table_exists(cursor, "bookmarks")
+    has_bookmark_tag_tables = (
+        has_bookmarks_table
+        and _table_exists(cursor, "bookmark_tags")
+        and _table_exists(cursor, "bookmark_tag_links")
+    )
 
     _model_expr, _source_file_expr, columns = _conversation_select_fragment(cursor, "c")
     primary_time_expr = _conversation_primary_time_expr(columns, "c")
     conversation_where_sql, params, used_optional_columns = _build_virtual_thread_conversation_where(
         filters,
-        has_bookmarks_table=_table_exists(cursor, "bookmarks"),
+        has_bookmarks_table=has_bookmarks_table,
+        has_bookmark_tag_tables=has_bookmark_tag_tables,
         table_alias="c",
         primary_time_expr=primary_time_expr,
     )
@@ -2152,6 +2744,16 @@ def build_virtual_thread_preview(filters, db_file=DB_FILE):
         )
         turn_params.append(f"%{response_contains.lower()}%")
 
+    bookmark_tags = _normalize_filter_values(filters.get("bookmarkTags"))
+    if bookmark_tags:
+        clause, clause_params = _build_bookmark_tag_exists_clause(
+            "p.conv_id || ':' || CAST(p.msg_index AS TEXT)",
+            bookmark_tags,
+            has_bookmark_tag_tables=has_bookmark_tag_tables,
+        )
+        turn_clauses.append(clause)
+        turn_params.extend(clause_params)
+
     rows = cursor.execute(
         f"""
         SELECT
@@ -2194,6 +2796,12 @@ def build_virtual_thread(filters, db_file=DB_FILE):
     conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
+    has_bookmarks_table = _table_exists(cursor, "bookmarks")
+    has_bookmark_tag_tables = (
+        has_bookmarks_table
+        and _table_exists(cursor, "bookmark_tags")
+        and _table_exists(cursor, "bookmark_tag_links")
+    )
     model_expr, source_file_expr, columns = _conversation_select_fragment(cursor, "c")
     source_created_at_expr = (
         "c.source_created_at AS source_created_at"
@@ -2209,7 +2817,8 @@ def build_virtual_thread(filters, db_file=DB_FILE):
     starred_prompt_counts = _fetch_starred_prompt_counts(cursor)
     where_sql, params, used_optional_columns = _build_virtual_thread_where(
         filters,
-        has_bookmarks_table=_table_exists(cursor, "bookmarks"),
+        has_bookmarks_table=has_bookmarks_table,
+        has_bookmark_tag_tables=has_bookmark_tag_tables,
     )
     if any(column not in columns for column in used_optional_columns):
         conn.close()

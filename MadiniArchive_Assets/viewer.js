@@ -58,13 +58,43 @@ let recentExtractFilters = [];
 let starredExtractFilters = [];
 let starredPromptEntries = [];
 let savedExtractViews = [];
-let bookmarkListEntries = [];
+let bookmarkTags = [];
+let bookmarkGroupOpenByKey = {};
+let selectedDirectoryPromptKeys = [];
+let directoryPromptSelectionAnchorKey = "";
+let selectedStarredPromptKeys = [];
+let starredPromptSelectionAnchorKey = "";
+let selectedBookmarkTagFilterIds = [];
+let bookmarkUndoStack = [];
+let bookmarkSelectionDragState = null;
+let bookmarkSelectionDragGhostEl = null;
+let bookmarkSelectionDragBound = false;
+let bookmarkSelectionSuppressClickUntil = 0;
+let bookmarkTagFilterClickSuppressUntil = 0;
 let extractPreviewTimer = null;
+let isExtractBookmarkTagMenuOpen = false;
 let virtualThreadCounter = 0;
 // Legacy/global fallback while virtual-tab selection is moving to per-tab state.
 let currentVirtualSelectionIndex = 0;
 let virtualTabScrollRestoreGuardUntil = 0;
 let rawSourceDebugByConvId = {};
+let mathFallbackLogCount = 0;
+
+window.addEventListener("error", (event) => {
+    const message = String(event?.message || "");
+    const filename = String(event?.filename || "");
+    const lineno = Number(event?.lineno || 0);
+    const colno = Number(event?.colno || 0);
+    if (!message && !filename) return;
+    console.error(`[WindowError] ${message} @ ${filename}:${lineno}:${colno}`);
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+    const reason = event?.reason;
+    const message = String(reason && (reason.stack || reason.message || reason) || "");
+    if (!message) return;
+    console.error(`[UnhandledRejection] ${message}`);
+});
 let bookmarkStatesByKey = {};
 let promptBookmarkLoadPromises = {};
 let virtualFragmentBookmarkLoadPromises = {};
@@ -76,13 +106,15 @@ let isExtractModelMenuOpen = false;
 let appliedExtractConversationIds = null;
 let extractPreviewRequestId = 0;
 let treeStructureRevision = 0;
+let mathJaxRuntimePromise = null;
+let pendingVisibleMathTypesetRoot = null;
+let pendingVisibleMathTypesetFrame = 0;
 const CLOSED_TAB_HISTORY_LIMIT = 20;
 const MANAGER_TAB_TITLES = {
-    recent_filters: "履歴",
     starred_filters: "保存したフィルタ",
-    starred_prompts: "ブックマーク",
+    starred_prompts: "タグ",
 };
-const PINNED_MANAGER_TAB_KINDS = ["recent_filters", "starred_prompts"];
+const PINNED_MANAGER_TAB_KINDS = ["starred_prompts"];
 
 const ROOT_DOCK_FADE_DISTANCE = 220;
 const ROOT_DOCK_MIN_OPACITY = 0.16;
@@ -94,7 +126,9 @@ const ANSWER_FADE_RANGE = 88;
 const TAB_REORDER_ARM_DISTANCE = 24;
 const TAB_DRAG_TOP_MARGIN = 10;
 const TAB_DRAG_BOTTOM_MARGIN = 10;
-const ACTIVE_MATH_RENDERER = "builtin";
+const BOOKMARK_SELECTION_DRAG_THRESHOLD = 7;
+const BOOKMARK_UNDO_LIMIT = 80;
+const ACTIVE_MATH_RENDERER = "mathjax";
 const MATH_ISLAND_CSS = `
 .math-shell,
 .math-shell * {
@@ -267,6 +301,32 @@ const MATH_ISLAND_CSS = `
 
 .math-accent-body {
     display: inline-block;
+}
+
+.math-boxed {
+    display: inline-block;
+    padding: 0.06em 0.34em;
+    border: 1px solid currentColor;
+    border-radius: 0.24em;
+    line-height: 1.15;
+    vertical-align: middle;
+}
+
+.math-tag {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 0.45em;
+    padding: 0 0.32em;
+    border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+    border-radius: 999px;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", sans-serif;
+    font-size: 0.8em;
+    font-weight: 600;
+    line-height: 1.5;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    vertical-align: middle;
+    opacity: 0.88;
 }
 
 .math-text {
@@ -442,6 +502,8 @@ const STORAGE_KEYS = {
 };
 
 const COMMON_MATH_OPERATOR_NAMES = Object.freeze([
+    "Im",
+    "Re",
     "arg",
     "cos",
     "cosh",
@@ -521,22 +583,228 @@ function escapeJsString(str) {
 
 function createHtmlPlaceholderStore(prefix = "HTML_PLACEHOLDER") {
     const values = [];
+    const tokenOpen = "\uE000";
+    const tokenClose = "\uE001";
+    const normalizedPrefix = String(prefix || "HTML_PLACEHOLDER");
+    const markerCode =
+        0xE100
+        + Array.from(normalizedPrefix).reduce((sum, char) => sum + char.charCodeAt(0), 0) % 256;
+    const tokenMarker = String.fromCharCode(markerCode);
     return {
         put(html) {
-            const token = `@@${prefix}_${values.length}@@`;
+            // Keep placeholders opaque through later markdown/math passes.
+            const token = `${tokenOpen}${tokenMarker}${values.length.toString(36)}${tokenClose}`;
             values.push(html);
             return token;
         },
         restore(text) {
-            const pattern = new RegExp(`@@${prefix}_(\\d+)@@`, "g");
-            return text.replace(pattern, (_match, index) => values[Number(index)] || "");
+            let nextText = String(text || "");
+            const patternSource = `${escapeRegex(tokenOpen)}${escapeRegex(tokenMarker)}([0-9a-z]+)${escapeRegex(tokenClose)}`;
+            let replaced = true;
+            while (replaced) {
+                replaced = false;
+                nextText = nextText.replace(new RegExp(patternSource, "g"), (_match, index) => {
+                    replaced = true;
+                    return values[parseInt(index, 36)] || "";
+                });
+            }
+            return nextText;
         },
     };
+}
+
+function decodeSafeHtmlEntities(sourceText) {
+    let nextText = String(sourceText || "");
+    const namedEntities = new Map([
+        ["nbsp", " "],
+        ["thinsp", "\u2009"],
+        ["middot", "·"],
+        ["times", "×"],
+        ["divide", "÷"],
+        ["plusmn", "±"],
+        ["apos", "'"],
+        ["quot", '"'],
+    ]);
+    const numericWhitelist = new Map([
+        [123, "{"],
+        [125, "}"],
+        [91, "["],
+        [93, "]"],
+        [40, "("],
+        [41, ")"],
+        [34, '"'],
+        [39, "'"],
+    ]);
+
+    const decodeOnePass = (inputText) => {
+        let outputText = String(inputText || "");
+        outputText = outputText.replace(/&amp;(?=(?:#\d+|#x[0-9a-f]+|[a-z]+);)/gi, "&");
+        outputText = outputText.replace(/&([a-z]+);/gi, (match, name) => {
+            return namedEntities.get(String(name || "").toLowerCase()) || match;
+        });
+        outputText = outputText.replace(/&#(\d+);/g, (match, digits) => {
+            const value = Number.parseInt(digits, 10);
+            return numericWhitelist.get(value) || match;
+        });
+        outputText = outputText.replace(/&#x([0-9a-f]+);/gi, (match, digits) => {
+            const value = Number.parseInt(digits, 16);
+            return numericWhitelist.get(value) || match;
+        });
+        return outputText;
+    };
+
+    let previousText = "";
+    while (nextText !== previousText) {
+        previousText = nextText;
+        nextText = decodeOnePass(nextText);
+    }
+    return nextText;
+}
+
+function normalizeExplicitMathDelimiters(sourceText) {
+    let nextText = String(sourceText || "");
+    // Some imported logs double-escape TeX delimiters like \\( ... \\).
+    // Collapse only the delimiter escapes so explicit TeX survives intact.
+    nextText = nextText.replace(/\\\\(?=[()[\]])/g, "\\");
+    return nextText;
+}
+
+function protectSafeHtmlSegments(sourceText, placeholders) {
+    if (!placeholders) return String(sourceText || "");
+    return String(sourceText || "").replace(/<\s*(br|wbr)\s*\/?\s*>/gi, (match) => {
+        const normalized = /^<\s*wbr/i.test(match) ? "<wbr>" : "<br>";
+        return placeholders.put(normalized);
+    });
+}
+
+function protectMarkdownStrongSegments(sourceText, placeholders) {
+    if (!placeholders) return String(sourceText || "");
+    let nextText = String(sourceText || "");
+    const strongPattern = /(\*\*|__)(?=\S)([^\n]*?\S)\1/g;
+    nextText = nextText.replace(strongPattern, (_match, _marker, inner) => {
+        return placeholders.put(`<strong>${inner}</strong>`);
+    });
+    return nextText;
+}
+
+function containsExplicitTeX(sourceText) {
+    return /\\(?:[A-Za-z]+|[\[\](){}])/u.test(String(sourceText || ""));
+}
+
+function containsProtectedMathSyntax(sourceText) {
+    return (
+        /\\\[[\s\S]*?\\\]/.test(String(sourceText || ""))
+        || /\\\([\s\S]*?\\\)/.test(String(sourceText || ""))
+        || /\$\$[\s\S]*?\$\$/.test(String(sourceText || ""))
+        || /(^|[^\\])\$(?!\$)[^\n]+?(?<!\\)\$(?!\$)/.test(String(sourceText || ""))
+    );
+}
+
+function normalizePlainMathShorthand(sourceText) {
+    let nextText = String(sourceText || "");
+    nextText = normalizeBareMathCommands(nextText);
+    nextText = nextText.replace(
+        /\(([^()\n]+)\)\((n|k|m|i|j|\d+|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)\)/g,
+        (_match, body, order) => `(${body})^{(${order})}`
+    );
+    nextText = nextText.replace(
+        /\b([A-Za-z])\((n|k|m|i|j|\d+|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)\)/g,
+        (_match, symbol, order) => `${symbol}^{(${order})}`
+    );
+    nextText = nextText.replace(
+        /\\sum\s*([A-Za-z])\s*=\s*([A-Za-z0-9+-]+)\s*([A-Za-z0-9+-]+)/g,
+        (_match, variable, lower, upper) => `\\sum_{${variable}=${lower}}^{${upper}}`
+    );
+    nextText = nextText.replace(
+        /\\sum([A-Za-z])=([A-Za-z0-9+-]+)([A-Za-z])(?=[^A-Za-z]|$)/g,
+        (_match, variable, lower, upper) => `\\sum_{${variable}=${lower}}^{${upper}}`
+    );
+    return nextText;
+}
+
+function normalizeBareMathWords(sourceText) {
+    let nextText = String(sourceText || "");
+    const bareWordReplacements = [
+        ["langle", "⟨"],
+        ["rangle", "⟩"],
+        ["delta", "δ"],
+        ["cdot", "·"],
+        ["times", "×"],
+        ["infty", "∞"],
+    ];
+
+    bareWordReplacements.forEach(([word, replacement]) => {
+        const pattern = new RegExp(`(^|[^A-Za-z])${word}(?=[^A-Za-z]|$)`, "g");
+        nextText = nextText.replace(pattern, (_match, prefix) => `${prefix}${replacement}`);
+    });
+
+    return nextText;
+}
+
+function normalizeBareMathCommands(sourceText) {
+    let nextText = String(sourceText || "");
+    const bareCommandNames = [
+        "langle",
+        "rangle",
+        "delta",
+        "chi",
+        "theta",
+        "lambda",
+        "mu",
+        "pi",
+        "sigma",
+        "phi",
+        "psi",
+        "omega",
+        "sum",
+        "prod",
+        "int",
+        "sqrt",
+        "cdot",
+        "times",
+        "infty",
+        "leq",
+        "geq",
+        "neq",
+        "mid",
+        "varnothing",
+        "bigcup",
+        "bigcap",
+    ];
+
+    bareCommandNames.forEach((name) => {
+        const pattern = new RegExp(`(^|[^\\\\A-Za-z])${name}(?=[^A-Za-z]|$)`, "g");
+        nextText = nextText.replace(pattern, (_match, prefix) => `${prefix}\\${name}`);
+    });
+
+    nextText = nextText.replace(/(^|[^\\A-Za-z])mathbb\s*([A-Z])(?=[^A-Za-z]|$)/g, (_match, prefix, letter) => `${prefix}\\mathbb{${letter}}`);
+    nextText = nextText.replace(/(^|[^\\A-Za-z])mathbb([A-Z])(?=[^A-Za-z]|$)/g, (_match, prefix, letter) => `${prefix}\\mathbb{${letter}}`);
+    nextText = nextText.replace(/(^|[^\\A-Za-z])boldsymbol\s*([A-Za-z0-9])(?=[^A-Za-z0-9]|$)/g, (_match, prefix, symbol) => `${prefix}\\boldsymbol{${symbol}}`);
+    nextText = nextText.replace(/(^|[^\\A-Za-z])boxed\s*([A-Za-z0-9])(?=[^A-Za-z0-9]|$)/g, (_match, prefix, symbol) => `${prefix}\\boxed{${symbol}}`);
+    nextText = nextText.replace(/(^|[^\\A-Za-z])tag\s*([A-Za-z0-9_-]+)(?=[^A-Za-z0-9_-]|$)/g, (_match, prefix, label) => `${prefix}\\tag{${label}}`);
+    nextText = nextText.replace(/(?<!\\)\bbinom([A-Za-z0-9()+-]+)/g, (_match, rest) => {
+        const raw = String(rest || "");
+        const letterIndexes = Array.from(raw).flatMap((char, index) => /[A-Za-z]/.test(char) ? [index] : []);
+        if (letterIndexes.length < 2) {
+            return `binom${raw}`;
+        }
+        const splitIndex = letterIndexes[letterIndexes.length - 1];
+        const upper = raw.slice(0, splitIndex);
+        const lower = raw.slice(splitIndex);
+        if (!upper || !lower) {
+            return `binom${raw}`;
+        }
+        return `\\binom{${upper}}{${lower}}`;
+    });
+
+    return nextText;
 }
 
 function normalizeMathSourceArtifacts(sourceText) {
     let nextText = String(sourceText || "");
 
+    // Normalize common shorthand forms so the renderer can treat them like
+    // explicit TeX groups instead of leaking raw commands.
     // Recover common legacy math HTML snippets into TeX-like source before the
     // markdown and math passes run. This keeps old imported logs renderable.
     nextText = nextText.replace(
@@ -584,14 +852,96 @@ function normalizeMathSourceArtifacts(sourceText) {
         });
         return normalizedLine;
     });
+    nextText = lines.join("\n");
 
-    return lines.join("\n");
+    nextText = nextText
+        .split("\n")
+        .map((line) => {
+            const rawLine = String(line || "");
+            if (!rawLine.trim()) return rawLine;
+
+            if (containsExplicitTeX(rawLine)) {
+                return rawLine
+                    .replace(
+                        /\\(bar|vec|hat|widehat|tilde|overline)\s+((?:\\[A-Za-z]+\{[^{}]+\})|(?:\\[A-Za-z]+)|(?:[A-Za-z0-9]+(?:_[A-Za-z0-9]+)?))/g,
+                        (_match, command, operand) => `\\${command}{${operand}}`
+                    )
+                    .replace(
+                        /\\(mathbb|mathcal|mathbf|mathrm|mathit|boldsymbol)\s+((?:\\[A-Za-z]+\{[^{}]+\})|(?:\\[A-Za-z]+)|(?:[A-Za-z0-9]+(?:_[A-Za-z0-9]+)?))/g,
+                        (_match, command, operand) => `\\${command}{${operand}}`
+                    )
+                    .replace(
+                        /\\boxed\s+((?:\\[A-Za-z]+\{[^{}]+\})|(?:\\[A-Za-z]+)|(?:[A-Za-z0-9]+(?:_[A-Za-z0-9]+)?))/g,
+                        (_match, operand) => `\\boxed{${operand}}`
+                    )
+                    .replace(
+                        /\\tag\s+((?:\\[A-Za-z]+\{[^{}]+\})|(?:\\[A-Za-z]+)|(?:[A-Za-z0-9_-]+))/g,
+                        (_match, operand) => `\\tag{${operand}}`
+                    );
+            }
+
+            return normalizePlainMathShorthand(rawLine);
+        })
+        .join("\n");
+
+    return nextText;
+}
+
+function looksLikeMathishText(line) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) return false;
+    if (/^[-*]\s/.test(trimmed) || /^\d+\.\s/.test(trimmed)) return false;
+    if (/^<\s*\/?\s*[A-Za-z][^>]*>$/.test(trimmed)) return false;
+    if (/[。、「」『』【】]/.test(trimmed)) return false;
+
+    const mathSignals = [
+        /\\[A-Za-z]+/,
+        /[=+/*^_<>≤≥∑∫√∞∈∉⊂⊆∪∩≅↦→←δπμχλσφψωℂℝℤℕℚℙ⟨⟩]/,
+        /\b(?:binom|mathbb|boldsymbol|langle|rangle|delta|chi|theta|sum|int|prod|sqrt)\b/,
+    ];
+    if (!mathSignals.some((pattern) => pattern.test(trimmed))) {
+        return false;
+    }
+
+    const nonMathResidue = trimmed
+        .replace(/\\[A-Za-z]+\*?(?:\{[^{}]*\})?/g, "")
+        .replace(/\b(?:binom|mathbb|boldsymbol|langle|rangle|delta|chi|theta|sum|int|prod|sqrt)\b/g, "")
+        .replace(/[{}[\]()^_=+\-*/,:;.|<>~`'"\\\d\s≤≥∑∫√∞∈∉⊂⊆∪∩≅↦→←δπμχλσφψωℂℝℤℕℚℙ⟨⟩]/g, "")
+        .replace(/[A-Za-z]/g, "");
+    return nonMathResidue.length === 0;
+}
+
+function replaceInlineImplicitMath(sourceText, placeholders) {
+    let nextText = String(sourceText || "");
+    const explicitTokenPattern = /(?:\\[A-Za-z]+|[A-Za-z0-9{}_^=+\-*/<>|&.,'"():;\[\]⟨⟩≤≥∑∫√∞∈∉⊂⊆∪∩≅↦→←δπμχλσφψωℂℝℤℕℚℙ¯]| )+/g;
+    nextText = nextText.replace(/\\langle\s*([^\\\n]+?)\s*\\rangle/g, (_match, inner) => {
+        return placeholders.put(renderMathBlock(`\\langle ${inner} \\rangle`, false));
+    });
+    nextText = nextText.replace(/⟨([^⟨⟩\n]+?)⟩/g, (_match, inner) => {
+        return placeholders.put(renderMathBlock(`\\langle ${inner} \\rangle`, false));
+    });
+
+    nextText = nextText.replace(explicitTokenPattern, (candidate) => {
+        const trimmed = String(candidate || "").trim();
+        if (!trimmed.includes("\\")) return candidate;
+        if (trimmed.length < 3) return candidate;
+        if (!looksLikeMathishText(trimmed)) return candidate;
+        return placeholders.put(renderMathBlock(trimmed, false));
+    });
+
+    const tokenPattern = /[A-Za-z0-9\\{}_^=+\-*/<>|&.,'"():;\[\]⟨⟩∑∫√∞∈∉⊂⊆∪∩≅↦→←δπμχλσφψωℂℝℤℕℚℙ¯]+/g;
+    return nextText.replace(tokenPattern, (candidate) => {
+        if (candidate.length < 3) return candidate;
+        if (candidate.includes("\\")) return candidate;
+        if (!looksLikeMathishText(candidate)) return candidate;
+        return placeholders.put(renderMathBlock(candidate, false));
+    });
 }
 
 function renderMathFragment(source, htmlPlaceholders = null) {
     const placeholderStore = htmlPlaceholders || createHtmlPlaceholderStore("MATH_HTML");
     const shouldRestore = !htmlPlaceholders;
-    let html = escapeHTML(String(source || "").trim());
+    let html = escapeHTML(normalizeBareMathWords(String(source || "").trim()));
     const replacements = [
         ["\\displaystyle", ""],
         ["\\textstyle", ""],
@@ -610,56 +960,93 @@ function renderMathFragment(source, htmlPlaceholders = null) {
         ["\\le", "≤"],
         ["\\ge", "≥"],
         ["\\to", "→"],
+        ["\\leftrightarrow", "↔"],
+        ["\\longleftrightarrow", "↔"],
+        ["\\longrightarrow", "→"],
         ["\\rightarrow", "→"],
+        ["\\longmapsto", "↦"],
+        ["\\longmapsto", "↦"],
+        ["\\mapsto", "↦"],
+        ["\\longleftarrow", "←"],
         ["\\leftarrow", "←"],
         ["\\Rightarrow", "⇒"],
+        ["\\Longrightarrow", "⇒"],
         ["\\Leftarrow", "⇐"],
+        ["\\Longleftarrow", "⇐"],
+        ["\\cong", "≅"],
         ["\\infty", "∞"],
         ["\\partial", "∂"],
         ["\\nabla", "∇"],
         ["\\sum", "∑"],
         ["\\prod", "∏"],
         ["\\int", "∫"],
+        ["\\bigcup", "⋃"],
+        ["\\bigcap", "⋂"],
         ["\\forall", "∀"],
         ["\\exists", "∃"],
+        ["\\varnothing", "∅"],
         ["\\in", "∈"],
         ["\\notin", "∉"],
+        ["\\mid", "∣"],
         ["\\subseteq", "⊆"],
         ["\\supseteq", "⊇"],
         ["\\subset", "⊂"],
         ["\\supset", "⊃"],
+        ["\\setminus", "∖"],
         ["\\cup", "∪"],
         ["\\cap", "∩"],
         ["\\land", "∧"],
         ["\\lor", "∨"],
+        ["\\sim", "∼"],
         ["\\alpha", "α"],
         ["\\beta", "β"],
         ["\\gamma", "γ"],
         ["\\delta", "δ"],
+        ["\\eta", "η"],
         ["\\varepsilon", "ε"],
         ["\\epsilon", "ϵ"],
         ["\\theta", "θ"],
         ["\\vartheta", "ϑ"],
+        ["\\iota", "ι"],
+        ["\\kappa", "κ"],
         ["\\lambda", "λ"],
         ["\\mu", "μ"],
+        ["\\nu", "ν"],
+        ["\\xi", "ξ"],
         ["\\pi", "π"],
         ["\\varpi", "ϖ"],
         ["\\rho", "ρ"],
         ["\\varrho", "ϱ"],
         ["\\sigma", "σ"],
         ["\\varsigma", "ς"],
+        ["\\tau", "τ"],
+        ["\\upsilon", "υ"],
         ["\\phi", "φ"],
         ["\\varphi", "ϕ"],
+        ["\\chi", "χ"],
+        ["\\psi", "ψ"],
         ["\\omega", "ω"],
+        ["\\Gamma", "Γ"],
         ["\\Delta", "Δ"],
         ["\\Theta", "Θ"],
         ["\\Lambda", "Λ"],
+        ["\\Xi", "Ξ"],
         ["\\Pi", "Π"],
         ["\\Sigma", "Σ"],
+        ["\\Upsilon", "Υ"],
         ["\\Phi", "Φ"],
+        ["\\Psi", "Ψ"],
         ["\\Omega", "Ω"],
         ["\\left", ""],
         ["\\right", ""],
+        ["\\bigl", ""],
+        ["\\bigr", ""],
+        ["\\Bigl", ""],
+        ["\\Bigr", ""],
+        ["\\biggl", ""],
+        ["\\biggr", ""],
+        ["\\Biggl", ""],
+        ["\\Biggr", ""],
         ["\\quad", " "],
         ["\\qquad", "  "],
         ["\\ldots", "…"],
@@ -669,6 +1056,8 @@ function renderMathFragment(source, htmlPlaceholders = null) {
         ["\\:", " "],
         ["\\;", " "],
         ["\\!", ""],
+        ["\\{", "&#123;"],
+        ["\\}", "&#125;"],
     ];
 
     replacements.forEach(([pattern, replacement]) => {
@@ -684,8 +1073,10 @@ function renderMathFragment(source, htmlPlaceholders = null) {
         );
         html = html.replace(/\\vec\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAccent("vec", inner, placeholderStore)));
         html = html.replace(/\\hat\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAccent("hat", inner, placeholderStore)));
+        html = html.replace(/\\widehat\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAccent("widehat", inner, placeholderStore)));
         html = html.replace(/\\tilde\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAccent("tilde", inner, placeholderStore)));
         html = html.replace(/\\bar\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAccent("bar", inner, placeholderStore)));
+        html = html.replace(/\\overline\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAccent("overline", inner, placeholderStore)));
         html = html.replace(
             new RegExp(String.raw`\\(${COMMON_MATH_OPERATOR_NAMES.join("|")})\b`, "g"),
             (_match, operatorName) => placeholderStore.put(renderMathOperator(operatorName))
@@ -694,8 +1085,11 @@ function renderMathFragment(source, htmlPlaceholders = null) {
         html = html.replace(/\\mathrm\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-text math-text-roman">${renderMathFragment(inner, placeholderStore)}</span>`));
         html = html.replace(/\\mathbf\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-text math-text-bold">${renderMathFragment(inner, placeholderStore)}</span>`));
         html = html.replace(/\\mathit\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-text math-text-italic">${renderMathFragment(inner, placeholderStore)}</span>`));
+        html = html.replace(/\\boldsymbol\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-text math-text-bold">${renderMathFragment(inner, placeholderStore)}</span>`));
         html = html.replace(/\\mathbb\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAlphabet("mathbb", inner, placeholderStore)));
         html = html.replace(/\\mathcal\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(renderMathAlphabet("mathcal", inner, placeholderStore)));
+        html = html.replace(/\\boxed\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-boxed">${renderMathFragment(inner, placeholderStore)}</span>`));
+        html = html.replace(/\\tag\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-tag">(${renderMathFragment(inner, placeholderStore)})</span>`));
         html = html.replace(/\\text\{([^{}]+)\}/g, (_match, inner) => placeholderStore.put(`<span class="math-text">${inner}</span>`));
         html = html.replace(/\\sqrt\{([^{}]+)\}/g, (_match, inner) => (
             placeholderStore.put(`<span class="math-sqrt"><span class="math-sqrt-sign">√</span><span class="math-sqrt-body">${renderMathFragment(inner, placeholderStore)}</span></span>`)
@@ -754,8 +1148,10 @@ function renderMathAccent(kind, inner, htmlPlaceholders = null) {
     const accentMarks = {
         vec: "→",
         hat: "^",
+        widehat: "^",
         tilde: "~",
         bar: "¯",
+        overline: "¯",
     };
     const accentMark = accentMarks[kind] || "¯";
     return `<span class="math-accent math-accent-${kind}"><span class="math-accent-mark">${accentMark}</span><span class="math-accent-body">${renderMathFragment(inner, htmlPlaceholders)}</span></span>`;
@@ -840,6 +1236,15 @@ function renderMathFallback(source, displayMode = false) {
     return `<span class="math-inline math-fallback math-fallback-inline" data-math-fallback="true"><code class="math-tex-raw">${rawSource}</code></span>`;
 }
 
+function renderMathJaxNode(source, displayMode = false) {
+    const rawSource = String(source || "").trim();
+    const tag = displayMode ? "div" : "span";
+    const className = displayMode ? "math-display math-renderer-mathjax" : "math-inline math-renderer-mathjax";
+    const openDelimiter = displayMode ? "\\[" : "\\(";
+    const closeDelimiter = displayMode ? "\\]" : "\\)";
+    return `<${tag} class="${className}" data-math-renderer="mathjax" data-math-source="${escapeHTML(encodeURIComponent(rawSource))}">${openDelimiter}${escapeHTML(rawSource)}${closeDelimiter}</${tag}>`;
+}
+
 function buildMathHtmlNode({ source, displayMode = false, renderedHtml = "", evaluation = null }) {
     const tag = displayMode ? "div" : "span";
     const className = displayMode ? "math-display" : "math-inline";
@@ -851,6 +1256,9 @@ function buildMathHtmlNode({ source, displayMode = false, renderedHtml = "", eva
 }
 
 function renderMathBlock(source, displayMode = false) {
+    if (ACTIVE_MATH_RENDERER === "mathjax") {
+        return renderMathJaxNode(source, displayMode);
+    }
     try {
         let rendered = renderMathFragment(source);
         if (displayMode && String(source || "").includes("\n")) {
@@ -867,13 +1275,233 @@ function renderMathBlock(source, displayMode = false) {
 }
 
 function ensureRenderer() {
-    return ACTIVE_MATH_RENDERER;
+    if (
+        ACTIVE_MATH_RENDERER === "mathjax"
+        && window.MathJax
+        && (
+            typeof window.MathJax.typesetPromise === "function"
+            || window.MathJax.startup?.promise
+            || window.MathJax.startup?.document
+        )
+    ) {
+        return "mathjax";
+    }
+    return "builtin";
 }
 
-function isolateRenderedMath(root) {
+function ensureMathJaxTypesetMethods() {
+    if (!window.MathJax?.startup?.document) return;
+    const startup = window.MathJax.startup;
+    if (typeof window.MathJax.typesetPromise === "function") return;
+
+    if (typeof startup.makeTypesetMethods === "function") {
+        try {
+            startup.makeTypesetMethods();
+        } catch (_error) {
+            // Fall through to manual method wiring below.
+        }
+    }
+    if (typeof window.MathJax.typesetPromise === "function") return;
+
+    window.MathJax.typesetPromise = (elements = null) => {
+        const mathDocument = startup.document;
+        const nodes = Array.isArray(elements)
+            ? elements.filter(Boolean)
+            : (elements ? [elements] : null);
+        const previousElements = mathDocument.options?.elements;
+        if (mathDocument.options) {
+            mathDocument.options.elements = nodes;
+        }
+        if (typeof mathDocument.reset === "function") {
+            mathDocument.reset();
+        }
+        const renderResult =
+            typeof mathDocument.renderPromise === "function"
+                ? mathDocument.renderPromise()
+                : (typeof mathDocument.render === "function"
+                    ? (mathDocument.render(), Promise.resolve())
+                    : Promise.reject(new Error("MathJax render method is unavailable")));
+        return Promise.resolve(renderResult).finally(() => {
+            if (mathDocument.options) {
+                mathDocument.options.elements = previousElements;
+            }
+        });
+    };
+    if (typeof window.MathJax.typeset !== "function") {
+        window.MathJax.typeset = (elements = null) => {
+            const mathDocument = startup.document;
+            const nodes = Array.isArray(elements)
+                ? elements.filter(Boolean)
+                : (elements ? [elements] : null);
+            const previousElements = mathDocument.options?.elements;
+            if (mathDocument.options) {
+                mathDocument.options.elements = nodes;
+            }
+            if (typeof mathDocument.reset === "function") {
+                mathDocument.reset();
+            }
+            if (typeof mathDocument.render === "function") {
+                mathDocument.render();
+            }
+            if (mathDocument.options) {
+                mathDocument.options.elements = previousElements;
+            }
+        };
+    }
+}
+
+function initMathJaxRuntime(options = {}) {
+    const timeoutMs =
+        Number.isFinite(options?.timeoutMs) && Number(options.timeoutMs) > 0
+            ? Number(options.timeoutMs)
+            : null;
+    if (ensureRenderer() !== "mathjax") {
+        return Promise.resolve("builtin");
+    }
+    if (typeof window.MathJax?.typesetPromise === "function") {
+        return Promise.resolve("mathjax");
+    }
+    if (mathJaxRuntimePromise) {
+        if (timeoutMs == null) {
+            return mathJaxRuntimePromise;
+        }
+        return Promise.race([
+            mathJaxRuntimePromise,
+            new Promise((resolve) => {
+                window.setTimeout(() => resolve("timeout"), timeoutMs);
+            }),
+        ]);
+    }
+    const startupPromise = window.MathJax?.startup?.promise;
+    if (!startupPromise) {
+        ensureMathJaxTypesetMethods();
+        return Promise.resolve(ensureRenderer());
+    }
+    mathJaxRuntimePromise = Promise.resolve(startupPromise)
+        .then(() => {
+            ensureMathJaxTypesetMethods();
+            return ensureRenderer();
+        })
+        .catch((_error) => {
+            mathJaxRuntimePromise = null;
+            return "builtin";
+        });
+    if (timeoutMs == null) {
+        return mathJaxRuntimePromise;
+    }
+    return Promise.race([
+        mathJaxRuntimePromise,
+        new Promise((resolve) => {
+            window.setTimeout(() => resolve("timeout"), timeoutMs);
+        }),
+    ]);
+}
+
+function queueMathJaxTypeset(mathNodes) {
+    const nodes = Array.isArray(mathNodes) ? mathNodes.filter(Boolean) : [];
+    if (!nodes.length) return Promise.resolve();
+    if (!window.MathJax) {
+        return Promise.reject(new Error("MathJax is not available"));
+    }
+    return initMathJaxRuntime().then(() => {
+        if (typeof window.MathJax.typesetPromise === "function") {
+            return window.MathJax.typesetPromise(nodes);
+        }
+        throw new Error("MathJax typesetPromise is unavailable");
+    });
+}
+
+function isMathNodeRenderable(node) {
+    if (!node || !node.isConnected) return false;
+    if (node.closest('[hidden], [aria-hidden="true"]')) return false;
+    const style = window.getComputedStyle(node);
+    if (!style || style.display === "none" || style.visibility === "hidden") {
+        return false;
+    }
+    if (typeof node.getClientRects === "function" && node.getClientRects().length > 0) {
+        return true;
+    }
+    const parentElement = node.parentElement;
+    if (!parentElement) return false;
+    const parentStyle = window.getComputedStyle(parentElement);
+    return Boolean(parentStyle && parentStyle.display !== "none" && parentStyle.visibility !== "hidden");
+}
+
+function isMathNodeNearViewerViewport(node, marginPx = 420) {
+    if (!node || !node.isConnected) return false;
+    const viewer = document.getElementById("chat-viewer");
+    const nodeRect = typeof node.getBoundingClientRect === "function" ? node.getBoundingClientRect() : null;
+    if (!nodeRect) return false;
+    if (!viewer || typeof viewer.getBoundingClientRect !== "function") {
+        const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+        return nodeRect.bottom >= -marginPx && nodeRect.top <= viewportHeight + marginPx;
+    }
+    const viewerRect = viewer.getBoundingClientRect();
+    return nodeRect.bottom >= viewerRect.top - marginPx && nodeRect.top <= viewerRect.bottom + marginPx;
+}
+
+function scheduleVisibleMathTypeset(root = document.getElementById("chat-viewer")) {
+    if (!root || ensureRenderer() !== "mathjax") return;
+    pendingVisibleMathTypesetRoot = root;
+    if (pendingVisibleMathTypesetFrame) return;
+    pendingVisibleMathTypesetFrame = window.requestAnimationFrame(() => {
+        pendingVisibleMathTypesetFrame = 0;
+        const targetRoot = pendingVisibleMathTypesetRoot;
+        pendingVisibleMathTypesetRoot = null;
+        if (!targetRoot || !targetRoot.isConnected) return;
+        isolateRenderedMath(targetRoot, { visibleOnly: true });
+    });
+}
+
+function isolateRenderedMath(root, options = {}) {
     if (!root?.querySelectorAll) return;
 
-    root.querySelectorAll(".math-inline, .math-display").forEach((node) => {
+    if (ensureRenderer() === "mathjax") {
+        const visibleOnly = options.visibleOnly !== false;
+        const viewportMargin = Number.isFinite(options.viewportMargin) ? options.viewportMargin : 420;
+        const mathNodes = Array.from(root.querySelectorAll('[data-math-renderer="mathjax"]'))
+            .filter((node) => isMathNodeRenderable(node))
+            .filter((node) => !visibleOnly || isMathNodeNearViewerViewport(node, viewportMargin))
+            .filter((node) => node.dataset.mathPending !== "true")
+            .filter((node) => node.dataset.mathReady !== "true");
+        if (!mathNodes.length) return;
+        let sequence = Promise.resolve();
+        mathNodes.forEach((node) => {
+            sequence = sequence.then(() => {
+                if (node.dataset.mathFallback === "true" || node.dataset.mathReady === "true") {
+                    return null;
+                }
+                node.dataset.mathPending = "true";
+                return queueMathJaxTypeset([node])
+                    .then(() => {
+                        node.dataset.mathReady = "true";
+                        delete node.dataset.mathPending;
+                    })
+                    .catch((nodeError) => {
+                        delete node.dataset.mathPending;
+                        const source = (() => {
+                            try {
+                                return decodeURIComponent(String(node.dataset.mathSource || ""));
+                            } catch (_decodeError) {
+                                return String(node.textContent || "").trim();
+                            }
+                        })();
+                        if (mathFallbackLogCount < 40) {
+                            console.error(
+                                `[MathFallback] display=${node.classList.contains("math-display") ? "block" : "inline"} source=${source} error=${String(nodeError && (nodeError.stack || nodeError.message || nodeError))}`
+                            );
+                            mathFallbackLogCount += 1;
+                        }
+                        node.dataset.mathFallback = "true";
+                        node.outerHTML = renderMathFallback(source, node.classList.contains("math-display"));
+                        return null;
+                    });
+            });
+        });
+        return;
+    }
+
+    root.querySelectorAll('[data-math-rendered="true"], [data-math-fallback="true"]').forEach((node) => {
         if (node.dataset.mathIsolated === "true") return;
         if (typeof node.attachShadow !== "function") return;
         if (node.shadowRoot) {
@@ -971,7 +1599,7 @@ function looksLikeStandaloneMathBlockStart(line) {
     const trimmed = String(line || "").trim();
     if (!trimmed) return false;
     return (
-        looksLikeStandaloneMathLine(trimmed)
+        looksLikeMathishText(trimmed)
         || /\\begin\{(?:bmatrix|pmatrix|matrix)\}/.test(trimmed)
     );
 }
@@ -981,7 +1609,7 @@ function looksLikeStandaloneMathBlockContinuation(line) {
     if (!trimmed) return false;
     if (/^[-*]\s/.test(trimmed) || /^\d+\.\s/.test(trimmed)) return false;
     if (/[。、「」『』【】]/.test(trimmed)) return false;
-    if (looksLikeStandaloneMathLine(trimmed)) return true;
+    if (looksLikeMathishText(trimmed)) return true;
     if (/[&=+\-*/^_<>]/.test(trimmed)) return true;
     if (/^[A-Za-z0-9]+(?:\s+[A-Za-z0-9]+)*$/.test(trimmed) && trimmed.length <= 16) {
         return true;
@@ -1032,17 +1660,7 @@ function replaceStandaloneMathBlocks(sourceText, placeholders) {
 
 function looksLikeStandaloneMathLine(line) {
     const trimmed = String(line || "").trim();
-    if (!trimmed) return false;
-    if (!trimmed.includes("\\")) return false;
-    if (/^[-*]\s/.test(trimmed) || /^\d+\.\s/.test(trimmed)) return false;
-    if (/[。、「」『』【】]/.test(trimmed)) return false;
-    if (!/\\[A-Za-z]+/.test(trimmed)) return false;
-
-    const reduced = trimmed
-        .replace(/\\[A-Za-z]+\*?(?:\{[^{}]*\})?/g, "")
-        .replace(/[{}[\]()^_=+\-*/,:;.|<>~`'"\d\s]/g, "")
-        .replace(/[A-Za-z]/g, "");
-    return reduced.length === 0;
+    return looksLikeMathishText(trimmed);
 }
 
 function replaceStandaloneMathLines(sourceText, placeholders) {
@@ -1750,10 +2368,27 @@ function getBookmarkToggleGlyphHtml(bookmarked, labels = {}) {
     const iconKind = bookmarked
         ? labels.activeIconKind || labels.iconKind || ""
         : labels.inactiveIconKind || labels.iconKind || "";
+    if (iconKind === "tab-button-kind-tag") {
+        return buildTagOutlineIconHtml("bookmark-toggle-glyph", { filled: bookmarked });
+    }
     if (iconKind) {
         return `<span class="bookmark-toggle-glyph ${escapeHTML(iconKind)}" aria-hidden="true"></span>`;
     }
     return bookmarked ? "★" : "☆";
+}
+
+function buildTagOutlineIconHtml(extraClasses = "", options = {}) {
+    const className = [
+        "tag-outline-icon",
+        extraClasses,
+        options?.filled ? "is-filled" : "",
+    ].filter(Boolean).join(" ");
+    return `
+        <svg class="${escapeHTML(className)}" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+            <path class="tag-outline-shape" d="M6.2 2.5h6.1l1.2 1.2v6.1l-4.4 4.4H3.7L2.5 13V6.9z"></path>
+            <circle class="tag-outline-hole" cx="10.1" cy="5.9" r="1.15"></circle>
+        </svg>
+    `;
 }
 
 function buildThreadBookmarkTargetSpec(conv) {
@@ -1779,6 +2414,16 @@ function getBookmarkStateKey(targetOrType, targetId = "") {
 function cacheBookmarkState(state) {
     const bookmarkTarget = normalizeBookmarkTargetSpec(state);
     if (!bookmarkTarget.targetType || !bookmarkTarget.targetId) return null;
+    const currentState = bookmarkStatesByKey[getBookmarkStateKey(bookmarkTarget)] || null;
+    const nextTags = Boolean(state?.bookmarked)
+        ? (
+            Array.isArray(state?.tags)
+                ? state.tags
+                : Array.isArray(currentState?.tags)
+                    ? currentState.tags
+                    : []
+        )
+        : [];
     const normalizedState = {
         targetType: bookmarkTarget.targetType,
         targetId: bookmarkTarget.targetId,
@@ -1788,6 +2433,7 @@ function cacheBookmarkState(state) {
                 : bookmarkTarget.payload,
         bookmarked: Boolean(state?.bookmarked),
         updatedAt: state?.updatedAt || null,
+        tags: nextTags,
     };
     bookmarkStatesByKey[getBookmarkStateKey(bookmarkTarget)] = normalizedState;
     return normalizedState;
@@ -1810,6 +2456,26 @@ function buildPromptBookmarkTargetSpec(conv, messageIndex, promptText = "") {
         role: "user",
         title: title || `Prompt ${messageIndex + 1}`,
     });
+}
+
+function buildDirectoryPromptSelectionKey(conversationId, messageIndex) {
+    const normalizedConversationId = String(conversationId || "").trim();
+    if (!normalizedConversationId || !Number.isInteger(messageIndex) || messageIndex < 0) {
+        return "";
+    }
+    return `${normalizedConversationId}:${messageIndex}`;
+}
+
+function parseDirectoryPromptSelectionKey(selectionKey) {
+    const normalizedKey = String(selectionKey || "").trim();
+    const delimiterIndex = normalizedKey.lastIndexOf(":");
+    if (delimiterIndex <= 0) return null;
+    const conversationId = normalizedKey.slice(0, delimiterIndex);
+    const messageIndex = Number.parseInt(normalizedKey.slice(delimiterIndex + 1), 10);
+    if (!conversationId || !Number.isInteger(messageIndex) || messageIndex < 0) {
+        return null;
+    }
+    return { conversationId, messageIndex };
 }
 
 function buildStableBookmarkHash(source) {
@@ -1874,8 +2540,8 @@ function buildBookmarkToggleButtonHtml(targetSpec, bookmarked, clickHandler, ext
         .filter(Boolean)
         .join(" ");
     const title = bookmarked
-        ? labels.activeTitle || "Bookmark is on"
-        : labels.inactiveTitle || "Bookmark this item";
+        ? labels.activeTitle || "マーク中"
+        : labels.inactiveTitle || "この項目をマーク";
     return `
         <button
             class="${buttonClasses}"
@@ -1891,27 +2557,33 @@ function buildBookmarkToggleButtonHtml(targetSpec, bookmarked, clickHandler, ext
     `;
 }
 
-function buildPromptBookmarkButtonHtml(targetSpec, bookmarked, clickHandler, extraClass = "") {
-    const bookmarkTarget = normalizeBookmarkTargetSpec(targetSpec);
-    const buttonClasses = [
-        "bookmark-target-toggle",
-        extraClass,
-        bookmarked ? "is-active" : "",
-    ]
-        .filter(Boolean)
-        .join(" ");
-    const title = bookmarked ? "Prompt star is on" : "Star this prompt";
+function buildPromptSidebarTagIndicatorHtml(bookmarked) {
     return `
-        <button
-            class="${buttonClasses}"
-            type="button"
-            data-bookmark-target-type="${escapeHTML(bookmarkTarget.targetType)}"
-            data-bookmark-target-id="${escapeHTML(bookmarkTarget.targetId)}"
-            aria-pressed="${bookmarked ? "true" : "false"}"
-            title="${escapeHTML(title)}"
-            onclick="${clickHandler}"
-        >${getBookmarkToggleGlyphHtml(bookmarked)}</button>
+        <span
+            class="prompt-nav-tag-indicator${bookmarked ? " is-active" : " is-empty"}"
+            aria-hidden="true"
+        >${bookmarked ? buildTagOutlineIconHtml("bookmark-toggle-glyph", { filled: true }) : ""}</span>
     `;
+}
+
+function syncConversationTagCountsFromStarredPrompts() {
+    const countsByConversationId = new Map();
+    (starredPromptEntries || []).forEach((entry) => {
+        const conversationId = String(entry?.parentConversationId || "").trim();
+        const hasTags = Array.isArray(entry?.tags) && entry.tags.length > 0;
+        if (!conversationId || !hasTags) {
+            return;
+        }
+        countsByConversationId.set(
+            conversationId,
+            (countsByConversationId.get(conversationId) || 0) + 1
+        );
+    });
+    chatData.forEach((conv) => {
+        const count = countsByConversationId.get(String(conv?.id || "").trim()) || 0;
+        conv.starredPromptCount = count;
+        conv.bookmarked = count > 0;
+    });
 }
 
 function animateCirclePillToggle(button, becameActive) {
@@ -1941,8 +2613,8 @@ function updateBookmarkTargetButtonState(targetSpec, bookmarked, labels = {}) {
             button.setAttribute(
                 "title",
                 bookmarked
-                    ? labels.activeTitle || "Bookmark is on"
-                    : labels.inactiveTitle || "Bookmark this item"
+                    ? labels.activeTitle || "マーク中"
+                    : labels.inactiveTitle || "この項目をマーク"
             );
             const activeIconKind = button.dataset.bookmarkActiveIconKind || labels.activeIconKind || labels.iconKind || "";
             const inactiveIconKind = button.dataset.bookmarkInactiveIconKind || labels.inactiveIconKind || labels.iconKind || "";
@@ -1972,7 +2644,6 @@ async function toggleConversationBookmarkByIndex(convIdx, event) {
     if (isSidebarFilterActive) {
         refreshDirectoryFromExtractFilters(true).catch(() => {});
     }
-    void refreshBookmarkList();
 }
 
 function ensureConversationTab(convIdx) {
@@ -3325,7 +3996,7 @@ function buildPromptPreviews(conv) {
             .filter((item) => item.message.role === "user")
             .map((item) => ({
                 messageIndex: item.index,
-                preview: (item.message.text || "").split("\n")[0].slice(0, 24),
+                preview: decodeSafeHtmlEntities(item.message.text || "").split("\n")[0].slice(0, 24),
             }));
     }
     return Array.isArray(conv.promptPreviews) ? conv.promptPreviews : [];
@@ -3983,6 +4654,13 @@ function ensureNativeShortcutFallbacks() {
             return;
         }
 
+        if (event.key.toLowerCase() === "z" && !event.shiftKey) {
+            event.preventDefault();
+            event.stopPropagation();
+            void undoLastBookmarkAction();
+            return;
+        }
+
         let action = null;
         let context = {};
         if (event.key === "[" || event.key === "{") {
@@ -4578,22 +5256,54 @@ function getConversationSourceClass(conv) {
     return String(conv?.source || "").toLowerCase();
 }
 
-function getCountFolderBadgeHtml(count, sourceClass = "", extraClasses = "", title = "Starred prompts") {
+function getCountFolderBadgeHtml(
+    count,
+    sourceClass = "",
+    extraClasses = "",
+    title = "Starred prompts",
+    options = {}
+) {
     const normalizedCount = Math.max(0, Number.parseInt(count, 10) || 0);
+    const expanded = Boolean(options.expanded);
     const className = [
         "count-folder-badge",
         extraClasses,
         normalizedCount <= 0 ? "is-empty" : "",
+        expanded ? "is-open" : "is-closed",
         sourceClass ? `source-label-${sourceClass}` : "",
     ].filter(Boolean).join(" ");
-    return `
-        <span class="${className}" title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}">
+    const iconMarkup = `
+        <span class="${className}" title="${escapeHTML(title)}" aria-hidden="true">
             <svg viewBox="0 0 28 22" focusable="false" aria-hidden="true">
+                ${
+                    expanded
+                        ? `
+                <path d="M4.35 5.35A2.35 2.35 0 0 1 6.7 3h4.12c.72 0 1.41.29 1.91.81l.92.96c.34.36.82.57 1.32.57h5.98a2.35 2.35 0 0 1 2.35 2.35v1.11H4.35V5.35Z" fill="currentColor" fill-opacity="0.14"></path>
+                <path d="M5.1 7.55h6.56c.7 0 1.37-.27 1.87-.77l.62-.61c.37-.36.86-.57 1.37-.57h5.26c.85 0 1.54.69 1.54 1.54v.55H5.1v-.14Z" fill="currentColor" fill-opacity="0.24"></path>
+                <path d="M3 10.15c.23-1.08 1.18-1.85 2.28-1.85h18.03c1.44 0 2.46 1.38 2.01 2.75l-1.68 5.17a2.35 2.35 0 0 1-2.24 1.62H4.82c-1.56 0-2.67-1.5-2.24-2.99L3 10.15Z" fill="currentColor" fill-opacity="0.28"></path>
+                <path d="M6.05 8.3h16.47c.96 0 1.72.85 1.6 1.8l-.09.68H4.59l.11-.54A2.02 2.02 0 0 1 6.05 8.3Z" fill="currentColor" fill-opacity="0.42"></path>
+                        `
+                        : `
                 <path d="M2.75 6.5A2.75 2.75 0 0 1 5.5 3.75h4.15c.74 0 1.43.33 1.91.89l.93 1.1c.24.28.59.45.97.45H22.5A2.75 2.75 0 0 1 25.25 8.94v8.81A2.75 2.75 0 0 1 22.5 20.5h-17A2.75 2.75 0 0 1 2.75 17.75V6.5Z" fill="currentColor" fill-opacity="0.14"></path>
                 <path d="M2.75 8.2A2.75 2.75 0 0 1 5.5 5.45h4.37c.56 0 1.09.22 1.49.6l.74.72c.4.39.93.6 1.49.6H22.5A2.75 2.75 0 0 1 25.25 10.12v7.63A2.75 2.75 0 0 1 22.5 20.5h-17A2.75 2.75 0 0 1 2.75 17.75V8.2Z" fill="currentColor" fill-opacity="0.24"></path>
+                        `
+                }
                 <text x="14" y="16.1" text-anchor="middle">${normalizedCount > 0 ? escapeHTML(String(normalizedCount)) : ""}</text>
             </svg>
         </span>
+    `;
+    if (!options.interactive) {
+        return iconMarkup;
+    }
+    return `
+        <button
+            class="count-folder-toggle"
+            type="button"
+            title="${escapeHTML(title)}"
+            aria-label="${escapeHTML(title)}"
+            aria-expanded="${expanded ? "true" : "false"}"
+            onclick="${options.clickHandler || ""}"
+        >${iconMarkup}</button>
     `;
 }
 
@@ -4605,13 +5315,36 @@ function getConversationStarredPromptCount(convId) {
         : 0;
 }
 
+function getPromptBookmarkTags(targetSpec) {
+    const cachedState = getCachedBookmarkState(targetSpec);
+    if (Array.isArray(cachedState?.tags) && cachedState.tags.length) {
+        return cachedState.tags;
+    }
+    const normalizedTarget = normalizeBookmarkTargetSpec(targetSpec);
+    const entry = (starredPromptEntries || []).find(
+        (item) => String(item.targetType || "") === normalizedTarget.targetType &&
+            String(item.targetId || "") === normalizedTarget.targetId
+    );
+    return Array.isArray(entry?.tags) ? entry.tags : [];
+}
+
+function buildPromptTagBadgesHtml(targetSpec) {
+    const tags = getPromptBookmarkTags(targetSpec);
+    if (!tags.length) {
+        return "";
+    }
+    return tags.map((tag) => `
+        <span class="prompt-inline-tag">${escapeHTML(tag?.name || "")}</span>
+    `).join("");
+}
+
 function getManagerTabKindIconHtml(kind, extraClasses = "") {
-    const iconClass =
-        kind === "recent_filters"
-            ? "tab-button-kind-clock"
-            : kind === "starred_prompts"
-                ? "tab-button-kind-star"
-                : "tab-button-kind-filter";
+    if (kind === "starred_prompts") {
+        return buildTagOutlineIconHtml(`tab-button-kind tab-button-kind-icon ${extraClasses}`);
+    }
+    const iconClass = kind === "recent_filters"
+        ? "tab-button-kind-clock"
+        : "tab-button-kind-filter";
     return `<span class="tab-button-kind tab-button-kind-icon ${iconClass} ${extraClasses}" aria-hidden="true"></span>`;
 }
 
@@ -4847,7 +5580,7 @@ function protectCodeSegments(sourceText, placeholders) {
     });
 }
 
-function renderMathSegments(sourceText, placeholders) {
+function renderExplicitMathSegments(sourceText, placeholders) {
     let nextText = sourceText;
     nextText = nextText.replace(/\\\[([\s\S]*?)\\\]/g, (_match, expr) => {
         return placeholders.put(renderMathBlock(expr, true));
@@ -4858,7 +5591,12 @@ function renderMathSegments(sourceText, placeholders) {
     nextText = nextText.replace(/\\\(([\s\S]*?)\\\)/g, (_match, expr) => {
         return placeholders.put(renderMathBlock(expr, false));
     });
-    nextText = replaceInlineDollarMath(nextText, placeholders);
+    return replaceInlineDollarMath(nextText, placeholders);
+}
+
+function renderMathSegments(sourceText, placeholders) {
+    let nextText = sourceText;
+    nextText = replaceInlineImplicitMath(nextText, placeholders);
     nextText = replaceStandaloneMathBlocks(nextText, placeholders);
     return replaceStandaloneMathLines(nextText, placeholders);
 }
@@ -4872,6 +5610,26 @@ function isMarkdownTableSeparator(line) {
 function parseMarkdownTableRow(line) {
     const normalized = String(line || "").trim().replace(/^\|/, "").replace(/\|$/, "");
     return normalized.split("|").map((cell) => cell.trim());
+}
+
+function renderMarkdownTableCell(cell) {
+    let value = String(cell || "");
+    const replacements = [
+        [/&amp;lt;\s*br\s*\/?\s*&amp;gt;/gi, "<br>"],
+        [/&amp;lt;\s*wbr\s*\/?\s*&amp;gt;/gi, "<wbr>"],
+        [/&#0*60;\s*br\s*\/?\s*&#0*62;/gi, "<br>"],
+        [/&#x0*3c;\s*br\s*\/?\s*&#x0*3e;/gi, "<br>"],
+        [/&#0*60;\s*wbr\s*\/?\s*&#0*62;/gi, "<wbr>"],
+        [/&#x0*3c;\s*wbr\s*\/?\s*&#x0*3e;/gi, "<wbr>"],
+        [/&lt;\s*br\s*\/?\s*&gt;/gi, "<br>"],
+        [/&lt;\s*wbr\s*\/?\s*&gt;/gi, "<wbr>"],
+        [/<\s*br\s*\/?\s*>/gi, "<br>"],
+        [/<\s*wbr\s*\/?\s*>/gi, "<wbr>"],
+    ];
+    replacements.forEach(([pattern, replacement]) => {
+        value = value.replace(pattern, replacement);
+    });
+    return value;
 }
 
 function buildMarkdownTableHtml(lines) {
@@ -4896,13 +5654,13 @@ function buildMarkdownTableHtml(lines) {
     if (!bodyRows.length) return null;
 
     const headerHtml = headerCells
-        .map((cell, index) => `<th style="text-align:${alignments[index]};">${cell || "&nbsp;"}</th>`)
+        .map((cell, index) => `<th style="text-align:${alignments[index]};">${renderMarkdownTableCell(cell) || "&nbsp;"}</th>`)
         .join("");
     const bodyHtml = bodyRows
         .map((cells) => {
             const normalizedCells = headerCells.map((_, index) => cells[index] || "");
             const cellHtml = normalizedCells
-                .map((cell, index) => `<td style="text-align:${alignments[index]};">${cell || "&nbsp;"}</td>`)
+                .map((cell, index) => `<td style="text-align:${alignments[index]};">${renderMarkdownTableCell(cell) || "&nbsp;"}</td>`)
                 .join("");
             return `<tr>${cellHtml}</tr>`;
         })
@@ -4968,21 +5726,35 @@ function applyBasicMarkdown(html) {
 function renderContent(text) {
     let sourceText = text || "";
     const codePlaceholders = createHtmlPlaceholderStore("CODE_PLACEHOLDER");
+    const htmlPlaceholders = createHtmlPlaceholderStore("HTML_PLACEHOLDER");
+    const markdownPlaceholders = createHtmlPlaceholderStore("MARKDOWN_PLACEHOLDER");
     const mathPlaceholders = createHtmlPlaceholderStore("MATH_PLACEHOLDER");
 
     // Keep code segments opaque so later markdown/math passes cannot corrupt them.
     sourceText = protectCodeSegments(sourceText, codePlaceholders);
-    sourceText = normalizeMathSourceArtifacts(sourceText);
-    sourceText = renderMathSegments(sourceText, mathPlaceholders);
+    sourceText = decodeSafeHtmlEntities(sourceText);
+    sourceText = normalizeExplicitMathDelimiters(sourceText);
+    sourceText = protectSafeHtmlSegments(sourceText, htmlPlaceholders);
+    const hasProtectedMathSyntax = containsProtectedMathSyntax(sourceText);
+    // Explicit TeX delimiters are already trustworthy source. Isolate them
+    // before shorthand repair so normal math is never rewritten by heuristics.
+    sourceText = renderExplicitMathSegments(sourceText, mathPlaceholders);
+    sourceText = protectMarkdownStrongSegments(sourceText, markdownPlaceholders);
+    if (!hasProtectedMathSyntax) {
+        sourceText = normalizeMathSourceArtifacts(sourceText);
+        sourceText = renderMathSegments(sourceText, mathPlaceholders);
+    }
 
     let html = escapeHTML(sourceText);
     html = applyBasicMarkdown(html);
+    html = htmlPlaceholders.restore(html);
+    html = markdownPlaceholders.restore(html);
     html = mathPlaceholders.restore(html);
     return codePlaceholders.restore(html);
 }
 
 function renderPromptContent(text) {
-    return escapeHTML(String(text || "")).replace(/\n/g, "<br>");
+    return renderContent(text);
 }
 
 function getCollapsedMessageStateKey(convOrId, messageIndex) {
@@ -5078,7 +5850,7 @@ function buildMessageAvatarButtonHtml(convIdx, messageIndex, role, options = {})
 }
 
 function buildCollapsedMessagePreview(text, maxLength = 120) {
-    const normalized = String(text || "").replace(/\s+/g, " ").trim();
+    const normalized = decodeSafeHtmlEntities(String(text || "")).replace(/\s+/g, " ").trim();
     if (!normalized) return "…";
     if (normalized.length <= maxLength) return normalized;
     return `${normalized.slice(0, maxLength).trimEnd()}…`;
@@ -5341,6 +6113,10 @@ function getSelectedExtractModels() {
     return readExtractMultiValue("extract-model");
 }
 
+function getSelectedExtractBookmarkTags() {
+    return readExtractMultiValue("extract-bookmark-tags");
+}
+
 function getAvailableExtractModels() {
     const selectedServices = getSelectedExtractServices();
     const modelsByService = extractFilterOptions.modelsByService || {};
@@ -5354,12 +6130,21 @@ function getAvailableExtractModels() {
     return merged;
 }
 
+function getAvailableExtractBookmarkTags() {
+    return (bookmarkTags || []).map((tag) => String(tag?.name || "").trim()).filter(Boolean);
+}
+
+function getAvailableExtractBookmarkTagEntries() {
+    return (bookmarkTags || []).filter((tag) => String(tag?.name || "").trim());
+}
+
 function getExtractFilterState() {
     // Canonical viewer-side extract filter state. Summary chips, preview requests,
     // directory scoping, and saved-filter payloads should all read from here.
     const filters = {
         service: getSelectedExtractServices(),
         model: getSelectedExtractModels(),
+        bookmarkTags: getSelectedExtractBookmarkTags(),
         bookmarked: normalizeBookmarkedFilterValue(
             document.getElementById("extract-bookmarked")?.value || "all"
         ),
@@ -5426,6 +6211,27 @@ function syncExtractModelTrigger() {
     }
 }
 
+function syncExtractBookmarkTagTrigger() {
+    const label = document.getElementById("extract-bookmark-tags-trigger-label");
+    const trigger = document.getElementById("extract-bookmark-tags-trigger");
+    if (!label || !trigger) return;
+    const availableTags = getAvailableExtractBookmarkTagEntries().map((tag) => String(tag.name || "").trim());
+    const selectedTags = getSelectedExtractBookmarkTags().filter((tagName) => availableTags.includes(tagName));
+    if (!availableTags.length) {
+        label.textContent = "タグなし";
+        trigger.disabled = true;
+    } else if (!selectedTags.length) {
+        label.textContent = "タグを選ぶ";
+        trigger.disabled = false;
+    } else if (selectedTags.length === 1) {
+        label.textContent = selectedTags[0];
+        trigger.disabled = false;
+    } else {
+        label.textContent = `${selectedTags.length}件選択`;
+        trigger.disabled = false;
+    }
+}
+
 function renderExtractModelMenu() {
     const menu = document.getElementById("extract-model-menu");
     if (!menu) return;
@@ -5446,21 +6252,66 @@ function renderExtractModelMenu() {
     }).join("");
 }
 
+function renderExtractBookmarkTagMenu() {
+    const menu = document.getElementById("extract-bookmark-tags-menu");
+    if (!menu) return;
+    const availableTags = getAvailableExtractBookmarkTagEntries();
+    const selectedTags = getSelectedExtractBookmarkTags();
+    if (!availableTags.length) {
+        menu.innerHTML = '<div class="extract-model-empty">タグがまだないよ</div>';
+        return;
+    }
+    menu.innerHTML = availableTags.map((tag) => {
+        const tagName = String(tag.name || "").trim();
+        const active = selectedTags.includes(tagName) ? " is-filter-active" : "";
+        return `
+            <button
+                class="bookmark-tag-dropzone extract-bookmark-tag-option${active}"
+                type="button"
+                data-value="${escapeHTML(tagName)}"
+                onclick="toggleExtractBookmarkTag('${escapeJsString(tagName)}', event)"
+            >
+                <span class="bookmark-tag-dropzone-label">${escapeHTML(tagName)}</span>
+                <span class="bookmark-tag-dropzone-count">${escapeHTML(String(tag.bookmarkCount || 0))}</span>
+            </button>
+        `;
+    }).join("");
+}
+
 function setExtractModelMenuOpen(isOpen) {
     isExtractModelMenuOpen = !!isOpen;
     const picker = document.getElementById("extract-model-picker");
     if (picker) picker.classList.toggle("open", isExtractModelMenuOpen);
 }
 
+function setExtractBookmarkTagMenuOpen(isOpen) {
+    isExtractBookmarkTagMenuOpen = !!isOpen;
+    const picker = document.getElementById("extract-bookmark-tags-picker");
+    if (picker) picker.classList.toggle("open", isExtractBookmarkTagMenuOpen);
+}
+
 function toggleExtractModelMenu(event) {
     if (event && typeof event.preventDefault === "function") event.preventDefault();
     const trigger = document.getElementById("extract-model-trigger");
     if (!trigger || trigger.disabled) return;
+    closeExtractBookmarkTagMenu();
     setExtractModelMenuOpen(!isExtractModelMenuOpen);
+}
+
+function toggleExtractBookmarkTagMenu(event) {
+    if (event && typeof event.preventDefault === "function") event.preventDefault();
+    const trigger = document.getElementById("extract-bookmark-tags-trigger");
+    if (!trigger || trigger.disabled) return;
+    closeExtractModelMenu();
+    setExtractBookmarkTagMenuOpen(!isExtractBookmarkTagMenuOpen);
 }
 
 function closeExtractModelMenu() {
     setExtractModelMenuOpen(false);
+}
+
+function closeExtractBookmarkTagMenu() {
+    setExtractBookmarkTagMenuOpen(false);
 }
 
 function toggleExtractModel(model, event) {
@@ -5472,6 +6323,18 @@ function toggleExtractModel(model, event) {
     writeExtractMultiValue("extract-model", nextModels);
     renderExtractModelMenu();
     syncExtractModelTrigger();
+    scheduleVirtualThreadPreview();
+}
+
+function toggleExtractBookmarkTag(tagName, event) {
+    if (event && typeof event.preventDefault === "function") event.preventDefault();
+    const selectedTags = getSelectedExtractBookmarkTags();
+    const nextTags = selectedTags.includes(tagName)
+        ? selectedTags.filter((item) => item !== tagName)
+        : [...selectedTags, tagName];
+    writeExtractMultiValue("extract-bookmark-tags", nextTags);
+    renderExtractBookmarkTagMenu();
+    syncExtractBookmarkTagTrigger();
     scheduleVirtualThreadPreview();
 }
 
@@ -5506,6 +6369,9 @@ function renderActiveFilterSummary(filters) {
     (filters.model || []).forEach((model) => {
         chips.push(`<button class="extract-chip" type="button" onclick="removeExtractFilterValue('model', '${escapeJsString(model)}')"><span class="extract-chip-label">model: ${escapeHTML(model)}</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
     });
+    (filters.bookmarkTags || []).forEach((tagName) => {
+        chips.push(`<button class="extract-chip" type="button" onclick="removeExtractFilterValue('bookmarkTags', '${escapeJsString(tagName)}')"><span class="extract-chip-label">Tag: ${escapeHTML(tagName)}</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
+    });
     EXTRACT_TEXT_FILTER_SPECS.forEach(({ key, summaryLabel }) => {
         const value = filters[key];
         if (String(value || "").trim()) {
@@ -5513,9 +6379,9 @@ function renderActiveFilterSummary(filters) {
         }
     });
     if (normalizeBookmarkedFilterValue(filters.bookmarked) === "bookmarked") {
-        chips.push(`<button class="extract-chip" type="button" onclick="clearExtractFilterField('bookmarked')"><span class="extract-chip-label">starred prompts: has starred prompt</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
+        chips.push(`<button class="extract-chip" type="button" onclick="clearExtractFilterField('bookmarked')"><span class="extract-chip-label">Tag: あり</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
     } else if (normalizeBookmarkedFilterValue(filters.bookmarked) === "not-bookmarked") {
-        chips.push(`<button class="extract-chip" type="button" onclick="clearExtractFilterField('bookmarked')"><span class="extract-chip-label">starred prompts: without starred prompt</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
+        chips.push(`<button class="extract-chip" type="button" onclick="clearExtractFilterField('bookmarked')"><span class="extract-chip-label">Tag: なし</span><span class="extract-chip-remove" aria-hidden="true">×</span></button>`);
     }
 
     root.innerHTML = chips.join("");
@@ -5536,17 +6402,28 @@ function removeExtractFilterValue(kind, value) {
         writeExtractMultiValue("extract-model", nextModels);
         renderExtractModelMenu();
         syncExtractModelTrigger();
+    } else if (kind === "bookmarkTags") {
+        const nextTags = getSelectedExtractBookmarkTags().filter((item) => item !== value);
+        writeExtractMultiValue("extract-bookmark-tags", nextTags);
+        renderExtractBookmarkTagMenu();
+        syncExtractBookmarkTagTrigger();
     }
     scheduleVirtualThreadPreview();
 }
 
 function clearExtractFilterField(key) {
     const spec = EXTRACT_TEXT_FILTER_SPECS.find((item) => item.key === key);
-    const elementId = spec ? spec.elementId : key === "bookmarked" ? "extract-bookmarked" : "";
-    if (!elementId) return;
-    const element = document.getElementById(elementId);
-    if (element) {
-        element.value = key === "bookmarked" ? "all" : "";
+    if (key === "bookmarkTags") {
+        writeExtractMultiValue("extract-bookmark-tags", []);
+        renderExtractBookmarkTagMenu();
+        syncExtractBookmarkTagTrigger();
+    } else {
+        const elementId = spec ? spec.elementId : key === "bookmarked" ? "extract-bookmarked" : "";
+        if (!elementId) return;
+        const element = document.getElementById(elementId);
+        if (element) {
+            element.value = key === "bookmarked" ? "all" : "";
+        }
     }
     scheduleVirtualThreadPreview();
 }
@@ -5572,8 +6449,12 @@ function setVirtualThreadFilters(filters) {
     );
     renderExtractModelMenu();
     syncExtractModelTrigger();
+    writeExtractMultiValue("extract-bookmark-tags", Array.isArray(nextFilters.bookmarkTags) ? nextFilters.bookmarkTags : []);
+    renderExtractBookmarkTagMenu();
+    syncExtractBookmarkTagTrigger();
     syncExtractSortButton();
     closeExtractModelMenu();
+    closeExtractBookmarkTagMenu();
     scheduleVirtualThreadPreview();
 }
 
@@ -5622,6 +6503,81 @@ function requestStarredPrompts() {
                     resolve(result ? JSON.parse(result) : []);
                 } catch (_error) {
                     resolve([]);
+                }
+            });
+        });
+    });
+}
+
+function requestBookmarkTags() {
+    return waitForBridge().then((bridge) => {
+        if (!bridge || !bridge.fetchBookmarkTags) {
+            return [];
+        }
+        return new Promise((resolve) => {
+            bridge.fetchBookmarkTags(function (result) {
+                try {
+                    resolve(result ? JSON.parse(result) : []);
+                } catch (_error) {
+                    resolve([]);
+                }
+            });
+        });
+    });
+}
+
+function requestCreateBookmarkTag(name) {
+    return waitForBridge().then((bridge) => {
+        if (!bridge || !bridge.createBookmarkTag) {
+            return null;
+        }
+        return new Promise((resolve) => {
+            bridge.createBookmarkTag(JSON.stringify({ name }), function (result) {
+                try {
+                    resolve(result ? JSON.parse(result) : null);
+                } catch (_error) {
+                    resolve(null);
+                }
+            });
+        });
+    });
+}
+
+function requestBookmarkTagMembership(tagId, targets, assigned) {
+    return waitForBridge().then((bridge) => {
+        if (!bridge || !bridge.setBookmarkTagMembership) {
+            return { tagId, assigned, affected: 0 };
+        }
+        return new Promise((resolve) => {
+            bridge.setBookmarkTagMembership(
+                JSON.stringify({
+                    tagId,
+                    targets,
+                    assigned,
+                }),
+                function (result) {
+                    try {
+                        resolve(result ? JSON.parse(result) : { tagId, assigned, affected: 0 });
+                    } catch (_error) {
+                        resolve({ tagId, assigned, affected: 0 });
+                    }
+                }
+            );
+        });
+    });
+}
+
+function requestDeleteBookmarkTag(tagId) {
+    return waitForBridge().then((bridge) => {
+        if (!bridge || !bridge.deleteBookmarkTag) {
+            return { deleted: 0 };
+        }
+        return new Promise((resolve) => {
+            bridge.deleteBookmarkTag(JSON.stringify({ tagId }), function (result) {
+                try {
+                    resolve(result ? JSON.parse(result) : { deleted: 0 });
+                } catch (_error) {
+                    resolve({ deleted: 0 });
                 }
             });
         });
@@ -5755,23 +6711,6 @@ function requestBookmarkStates(targetSpecs = []) {
             cacheBookmarkState(state);
         });
         return Array.isArray(states) ? states : [];
-    });
-}
-
-function requestBookmarksList() {
-    return waitForBridge().then((bridge) => {
-        if (!bridge || !bridge.fetchBookmarks) {
-            return [];
-        }
-        return new Promise((resolve) => {
-            bridge.fetchBookmarks(function (result) {
-                try {
-                    resolve(result ? JSON.parse(result) : []);
-                } catch (_error) {
-                    resolve([]);
-                }
-            });
-        });
     });
 }
 
@@ -5935,31 +6874,322 @@ function ensureSavedViewBookmarkStates(entries = savedExtractViews) {
     );
 }
 
-async function togglePromptBookmark(convIdx, messageIndex, event) {
-    event?.preventDefault?.();
-    event?.stopPropagation?.();
-    const conv = await loadConversationDetail(convIdx);
-    const message = conv?.messages?.[messageIndex];
-    if (!conv?.id || message?.role !== "user") return;
-    const bookmarkTarget = buildPromptBookmarkTargetSpec(conv, messageIndex, message.text || "");
-    const currentState = getCachedBookmarkState(bookmarkTarget);
-    const nextState = !Boolean(currentState?.bookmarked);
-    const result = await requestBookmarkChange(bookmarkTarget, nextState);
-    updateBookmarkTargetButtonState(bookmarkTarget, result?.bookmarked, {
-        activeTitle: "Prompt star is on",
-        inactiveTitle: "Star this prompt",
+function getVisibleDirectoryPromptSelectionKeys() {
+    return Array.from(document.querySelectorAll("#index-tree .prompt-item-row[data-selection-key]"))
+        .map((row) => String(row.dataset.selectionKey || "").trim())
+        .filter(Boolean);
+}
+
+function syncDirectoryPromptSelectionClasses(options = {}) {
+    const rows = Array.from(document.querySelectorAll("#index-tree .prompt-item-row[data-selection-key]"));
+    const visibleKeys = rows
+        .map((row) => String(row.dataset.selectionKey || "").trim())
+        .filter(Boolean);
+    if (options.pruneToVisible) {
+        const visibleKeySet = new Set(visibleKeys);
+        selectedDirectoryPromptKeys = selectedDirectoryPromptKeys.filter((key) => visibleKeySet.has(key));
+        if (
+            directoryPromptSelectionAnchorKey &&
+            !visibleKeySet.has(directoryPromptSelectionAnchorKey)
+        ) {
+            directoryPromptSelectionAnchorKey = selectedDirectoryPromptKeys[0] || "";
+        }
+    }
+    const selectedKeySet = new Set(selectedDirectoryPromptKeys);
+    rows.forEach((row) => {
+        const selectionKey = String(row.dataset.selectionKey || "").trim();
+        const isSelected = selectedKeySet.has(selectionKey);
+        row.classList.toggle("is-selected", isSelected);
+        row.setAttribute("aria-selected", isSelected ? "true" : "false");
     });
-    const previousCounted = Boolean(currentState?.bookmarked) ? 1 : 0;
-    const nextCounted = Boolean(result?.bookmarked) ? 1 : 0;
-    if (previousCounted !== nextCounted) {
-        updateConversationStarredPromptCount(conv.id, nextCounted - previousCounted);
+    syncStarredPromptSelectionControls();
+}
+
+function setDirectoryPromptSelection(keys, options = {}) {
+    const uniqueKeys = Array.from(
+        new Set(
+            (Array.isArray(keys) ? keys : [])
+                .map((key) => String(key || "").trim())
+                .filter(Boolean)
+        )
+    );
+    selectedDirectoryPromptKeys = uniqueKeys;
+    if (Object.prototype.hasOwnProperty.call(options, "anchorKey")) {
+        directoryPromptSelectionAnchorKey = String(options.anchorKey || "").trim();
+    } else if (!uniqueKeys.length) {
+        directoryPromptSelectionAnchorKey = "";
+    } else if (!directoryPromptSelectionAnchorKey) {
+        directoryPromptSelectionAnchorKey = uniqueKeys[0];
+    }
+    syncDirectoryPromptSelectionClasses();
+    return uniqueKeys;
+}
+
+function clearDirectoryPromptSelection(nextAnchorKey = "") {
+    return setDirectoryPromptSelection([], { anchorKey: nextAnchorKey });
+}
+
+function armDirectoryPromptDrag(convIdx, messageIndex, event) {
+    if ((event?.button ?? 0) !== 0) return;
+    const convId = String(chatData[convIdx]?.id || "");
+    const selectionKey = buildDirectoryPromptSelectionKey(convId, messageIndex);
+    if (!selectionKey) return;
+    const selectedKeys = selectedDirectoryPromptKeys.includes(selectionKey)
+        ? selectedDirectoryPromptKeys.slice()
+        : [selectionKey];
+    bookmarkSelectionDragState = {
+        dragKind: "directory-prompt-selection",
+        selectionKey,
+        selectedKeys,
+        filterIdsSnapshot: selectedBookmarkTagFilterIds.slice(),
+        startX: event?.clientX ?? 0,
+        startY: event?.clientY ?? 0,
+        active: false,
+        hoverKind: "",
+        hoverTagId: "",
+    };
+}
+
+function armDirectoryFolderDrag(convIdx, event) {
+    if ((event?.button ?? 0) !== 0) return;
+    if (!Number.isInteger(convIdx) || convIdx < 0) return;
+    bookmarkSelectionDragState = {
+        dragKind: "directory-folder",
+        convIdx,
+        filterIdsSnapshot: selectedBookmarkTagFilterIds.slice(),
+        startX: event?.clientX ?? 0,
+        startY: event?.clientY ?? 0,
+        active: false,
+        hoverKind: "",
+        hoverTagId: "",
+    };
+}
+
+function selectDirectoryPromptRange(targetSelectionKey) {
+    const normalizedTargetKey = String(targetSelectionKey || "").trim();
+    if (!normalizedTargetKey) return [];
+    if (!directoryPromptSelectionAnchorKey) {
+        return setDirectoryPromptSelection([normalizedTargetKey], {
+            anchorKey: normalizedTargetKey,
+        });
+    }
+    const visibleKeys = getVisibleDirectoryPromptSelectionKeys();
+    const anchorIndex = visibleKeys.indexOf(directoryPromptSelectionAnchorKey);
+    const targetIndex = visibleKeys.indexOf(normalizedTargetKey);
+    if (anchorIndex < 0 || targetIndex < 0) {
+        return setDirectoryPromptSelection([normalizedTargetKey], {
+            anchorKey: normalizedTargetKey,
+        });
+    }
+    const startIndex = Math.min(anchorIndex, targetIndex);
+    const endIndex = Math.max(anchorIndex, targetIndex);
+    return setDirectoryPromptSelection(visibleKeys.slice(startIndex, endIndex + 1), {
+        anchorKey: directoryPromptSelectionAnchorKey,
+    });
+}
+
+async function resolveDirectoryPromptSelectionEntries(selectionKeys) {
+    const normalizedSelections = Array.from(
+        new Set(
+            (Array.isArray(selectionKeys) ? selectionKeys : [])
+                .map((key) => String(key || "").trim())
+                .filter(Boolean)
+        )
+    );
+    const parsedSelections = normalizedSelections
+        .map((selectionKey) => ({
+            selectionKey,
+            parsed: parseDirectoryPromptSelectionKey(selectionKey),
+        }))
+        .filter((entry) => entry.parsed?.conversationId);
+    const convIndexes = Array.from(
+        new Set(
+            parsedSelections
+                .map((entry) => getConversationIndexById(entry.parsed.conversationId))
+                .filter((convIdx) => Number.isInteger(convIdx) && convIdx >= 0)
+        )
+    );
+    await Promise.all(convIndexes.map((convIdx) => loadConversationDetail(convIdx).catch(() => null)));
+    const entries = parsedSelections
+        .map((entry) => {
+            const convIdx = getConversationIndexById(entry.parsed.conversationId);
+            if (!Number.isInteger(convIdx) || convIdx < 0) return null;
+            const conv = chatData[convIdx];
+            const messageIndex = entry.parsed.messageIndex;
+            const message = conv?.messages?.[messageIndex];
+            if (!conv?.id || message?.role !== "user") return null;
+            const bookmarkTarget = buildPromptBookmarkTargetSpec(conv, messageIndex, message.text || "");
+            return {
+                selectionKey: entry.selectionKey,
+                conv,
+                convIdx,
+                messageIndex,
+                bookmarkTarget,
+                currentState: getCachedBookmarkState(bookmarkTarget),
+            };
+        })
+        .filter(Boolean);
+    const missingTargets = entries
+        .filter((entry) => !entry.currentState)
+        .map((entry) => entry.bookmarkTarget);
+    if (missingTargets.length) {
+        await requestBookmarkStates(missingTargets);
+    }
+    return entries.map((entry) => ({
+        ...entry,
+        currentState: getCachedBookmarkState(entry.bookmarkTarget),
+    }));
+}
+
+async function resolveVisibleConversationPromptEntries(convIdx) {
+    if (!Number.isInteger(convIdx) || convIdx < 0) return [];
+    const conv = await loadConversationDetail(convIdx).catch(() => null);
+    if (!conv?.id) return [];
+    const result = getCurrentConversationResult(conv);
+    const directoryFilterState = getDirectoryFilterState();
+    const visiblePreviewItems = getVisibleDirectoryPreviewItems(
+        buildPromptPreviews(conv),
+        result,
+        directoryFilterState
+    );
+    const entries = visiblePreviewItems
+        .map((item) => {
+            const message = conv?.messages?.[item.messageIndex];
+            if (message?.role !== "user") return null;
+            const bookmarkTarget = buildPromptBookmarkTargetSpec(conv, item.messageIndex, message.text || item.preview || "");
+            return {
+                selectionKey: buildDirectoryPromptSelectionKey(conv.id, item.messageIndex),
+                conv,
+                convIdx,
+                messageIndex: item.messageIndex,
+                bookmarkTarget,
+                currentState: getCachedBookmarkState(bookmarkTarget),
+            };
+        })
+        .filter(Boolean);
+    const missingTargets = entries
+        .filter((entry) => !entry.currentState)
+        .map((entry) => entry.bookmarkTarget);
+    if (missingTargets.length) {
+        await requestBookmarkStates(missingTargets);
+    }
+    return entries.map((entry) => ({
+        ...entry,
+        currentState: getCachedBookmarkState(entry.bookmarkTarget),
+    }));
+}
+
+async function resolveDirectoryPromptDragEntries(dragState) {
+    if (!dragState || typeof dragState !== "object") {
+        return [];
+    }
+    if (dragState.dragKind === "directory-folder") {
+        return resolveVisibleConversationPromptEntries(dragState.convIdx);
+    }
+    if (dragState.dragKind === "directory-prompt-selection") {
+        return resolveDirectoryPromptSelectionEntries(dragState.selectedKeys || []);
+    }
+    return [];
+}
+
+async function applyPromptBookmarkState(entries, nextBookmarked) {
+    const normalizedEntries = Array.isArray(entries) ? entries.filter(Boolean) : [];
+    if (!normalizedEntries.length) return;
+    const conversationDeltas = new Map();
+    const changedItems = [];
+    let didChange = false;
+    await Promise.all(
+        normalizedEntries.map(async (entry) => {
+            const previousBookmarked = Boolean(entry.currentState?.bookmarked);
+            if (previousBookmarked === Boolean(nextBookmarked)) {
+                updateBookmarkTargetButtonState(entry.bookmarkTarget, previousBookmarked, {
+                    activeTitle: "タグ対象に入ってる",
+                    inactiveTitle: "この prompt をタグ対象に入れる",
+                });
+                return;
+            }
+            const result = await requestBookmarkChange(entry.bookmarkTarget, nextBookmarked);
+            const finalBookmarked = Boolean(result?.bookmarked);
+            updateBookmarkTargetButtonState(entry.bookmarkTarget, finalBookmarked, {
+                activeTitle: "タグ対象に入ってる",
+                inactiveTitle: "この prompt をタグ対象に入れる",
+            });
+            const delta = (finalBookmarked ? 1 : 0) - (previousBookmarked ? 1 : 0);
+            if (!delta) return;
+            didChange = true;
+            changedItems.push({
+                target: entry.bookmarkTarget,
+                beforeBookmarked: previousBookmarked,
+                afterBookmarked: finalBookmarked,
+                parentConversationId: entry.conv?.id || "",
+            });
+            conversationDeltas.set(
+                entry.conv.id,
+                (conversationDeltas.get(entry.conv.id) || 0) + delta
+            );
+        })
+    );
+    conversationDeltas.forEach((delta, convId) => {
+        updateConversationStarredPromptCount(convId, delta);
+    });
+    if (didChange) {
+        pushBookmarkUndoAction({
+            type: "bookmark-state",
+            items: changedItems,
+        });
         renderTree();
         refreshCurrentTabStrip();
         if (isSidebarFilterActive) {
             refreshDirectoryFromExtractFilters(true).catch(() => {});
         }
+    } else {
+        syncDirectoryPromptSelectionClasses();
     }
     void refreshStarredPrompts();
+}
+
+async function togglePromptBookmark(convIdx, messageIndex, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const convId = String(chatData[convIdx]?.id || "");
+    const selectionKey = buildDirectoryPromptSelectionKey(convId, messageIndex);
+    if (event?.shiftKey && selectionKey) {
+        selectDirectoryPromptRange(selectionKey);
+    } else if (selectionKey && selectedDirectoryPromptKeys.length <= 1) {
+        directoryPromptSelectionAnchorKey = selectionKey;
+    }
+    const selectedKeysForTarget = selectionKey && selectedDirectoryPromptKeys.includes(selectionKey)
+        ? selectedDirectoryPromptKeys.slice()
+        : [];
+    const shouldApplySelection = selectedKeysForTarget.length > 1;
+    if (shouldApplySelection) {
+        const entries = await resolveDirectoryPromptSelectionEntries(selectedKeysForTarget);
+        const targetEntry = entries.find((entry) => entry.selectionKey === selectionKey);
+        if (!targetEntry) return;
+        const nextState = !Boolean(targetEntry.currentState?.bookmarked);
+        await applyPromptBookmarkState(entries, nextState);
+        return;
+    }
+    const conv = await loadConversationDetail(convIdx);
+    const message = conv?.messages?.[messageIndex];
+    if (!conv?.id || message?.role !== "user") return;
+    const bookmarkTarget = buildPromptBookmarkTargetSpec(conv, messageIndex, message.text || "");
+    let currentState = getCachedBookmarkState(bookmarkTarget);
+    if (!currentState) {
+        await requestBookmarkStates([bookmarkTarget]);
+        currentState = getCachedBookmarkState(bookmarkTarget);
+    }
+    const nextState = !Boolean(currentState?.bookmarked);
+    await applyPromptBookmarkState([
+        {
+            selectionKey,
+            conv,
+            convIdx,
+            messageIndex,
+            bookmarkTarget,
+            currentState,
+        },
+    ], nextState);
 }
 
 async function copyPromptMessage(convIdx, messageIndex, event) {
@@ -6038,11 +7268,21 @@ async function toggleVirtualFragmentBookmark(tabId, fragmentIndex, event) {
     const currentState = getCachedBookmarkState(bookmarkTarget);
     const nextState = !Boolean(currentState?.bookmarked);
     const result = await requestBookmarkChange(bookmarkTarget, nextState);
+    if (Boolean(result?.bookmarked) !== Boolean(currentState?.bookmarked)) {
+        pushBookmarkUndoAction({
+            type: "bookmark-state",
+            items: [{
+                target: bookmarkTarget,
+                beforeBookmarked: Boolean(currentState?.bookmarked),
+                afterBookmarked: Boolean(result?.bookmarked),
+                parentConversationId: fragment.parentConversationId || "",
+            }],
+        });
+    }
     updateBookmarkTargetButtonState(bookmarkTarget, result?.bookmarked, {
-        activeTitle: "Virtual fragment bookmark is on",
-        inactiveTitle: "Bookmark this fragment",
+        activeTitle: "断片をマーク中",
+        inactiveTitle: "この断片をマーク",
     });
-    void refreshBookmarkList();
 }
 
 async function toggleSavedViewBookmark(savedViewId, event) {
@@ -6054,18 +7294,21 @@ async function toggleSavedViewBookmark(savedViewId, event) {
     const currentState = getCachedBookmarkState(bookmarkTarget);
     const nextState = !Boolean(currentState?.bookmarked);
     const result = await requestBookmarkChange(bookmarkTarget, nextState);
-    updateBookmarkTargetButtonState(bookmarkTarget, result?.bookmarked, {
-        activeTitle: "Saved view bookmark is on",
-        inactiveTitle: "Bookmark this saved view",
-    });
-    void refreshBookmarkList();
-}
-
-function getBookmarkListActionLabel(entry) {
-    if (entry?.targetType === "saved_view") {
-        return "Reuse";
+    if (Boolean(result?.bookmarked) !== Boolean(currentState?.bookmarked)) {
+        pushBookmarkUndoAction({
+            type: "bookmark-state",
+            items: [{
+                target: bookmarkTarget,
+                beforeBookmarked: Boolean(currentState?.bookmarked),
+                afterBookmarked: Boolean(result?.bookmarked),
+                parentConversationId: "",
+            }],
+        });
     }
-    return "Open";
+    updateBookmarkTargetButtonState(bookmarkTarget, result?.bookmarked, {
+        activeTitle: "保存ビューをマーク中",
+        inactiveTitle: "この保存ビューをマーク",
+    });
 }
 
 async function openBookmarkEntry(targetType, targetId, payload) {
@@ -6101,72 +7344,6 @@ async function openBookmarkEntry(targetType, targetId, payload) {
         }
         showToast("Saved View がまだ読み込まれていないよ");
     }
-}
-
-async function toggleBookmarkListEntry(targetType, targetId, payload, event) {
-    event?.preventDefault?.();
-    event?.stopPropagation?.();
-    const bookmarkTarget = buildBookmarkTargetSpec(
-        targetType,
-        targetId,
-        parseBookmarkPayload(payload)
-    );
-    await requestBookmarkChange(bookmarkTarget, false);
-    void refreshBookmarkList();
-}
-
-function renderBookmarkList() {
-    const root = document.getElementById("extract-bookmark-list");
-    if (!root) return;
-
-    if (!Array.isArray(bookmarkListEntries) || bookmarkListEntries.length === 0) {
-        root.innerHTML = '<div class="extract-history-empty">まだ bookmark はないよ</div>';
-        return;
-    }
-
-    root.innerHTML = bookmarkListEntries.map((entry) => {
-        const updatedAt = formatFilterHistoryDate(entry.updatedAt || entry.createdAt || "");
-        const bookmarkTarget = buildBookmarkTargetSpec(
-            entry.targetType,
-            entry.targetId,
-            entry.payload || {}
-        );
-        const payload = encodeURIComponent(JSON.stringify(entry.payload || {}));
-        return `
-            <article class="extract-history-item">
-                <div class="extract-history-meta">
-                    <div class="extract-history-meta-main">
-                        <span class="extract-history-label">${escapeHTML(entry.label || entry.targetId || "Bookmark")}</span>
-                        <div class="extract-history-submeta">
-                            <span class="extract-history-type">${escapeHTML(entry.targetType || "unknown")}</span>
-                            <span class="extract-history-date">${escapeHTML(updatedAt ? `updated ${updatedAt}` : "")}</span>
-                        </div>
-                    </div>
-                    ${buildBookmarkToggleButtonHtml(
-                        bookmarkTarget,
-                        true,
-                        `toggleBookmarkListEntry('${escapeJsString(entry.targetType || "")}', '${escapeJsString(entry.targetId || "")}', '${payload}', event)`,
-                        "saved-view-bookmark",
-                        {
-                            activeTitle: "Remove bookmark",
-                            inactiveTitle: "Bookmark this item",
-                        }
-                    )}
-                </div>
-                <div class="extract-history-actions">
-                    <button class="extract-history-btn" type="button" onclick="openBookmarkEntry('${escapeJsString(entry.targetType || "")}', '${escapeJsString(entry.targetId || "")}', '${payload}')">${getBookmarkListActionLabel(entry)}</button>
-                </div>
-            </article>
-        `;
-    }).join("");
-}
-
-async function refreshBookmarkList() {
-    bookmarkListEntries = await requestBookmarksList();
-    (bookmarkListEntries || []).forEach((entry) => {
-        cacheBookmarkState(entry);
-    });
-    renderBookmarkList();
 }
 
 function formatFilterHistoryDate(value) {
@@ -6257,81 +7434,277 @@ function buildStarredFiltersMarkup() {
     }).join("");
 }
 
-function buildStarredPromptsMarkup() {
-    if (!Array.isArray(starredPromptEntries) || starredPromptEntries.length === 0) {
-        return '<div class="extract-history-empty">まだ starred prompt はないよ</div>';
+function getStarredPromptEntrySelectionKey(entry) {
+    return String(entry?.targetId || "").trim();
+}
+
+function getVisibleStarredPromptSelectionKeys() {
+    return Array.from(document.querySelectorAll(".extract-history-prompt-row[data-bookmark-selection-key]"))
+        .filter((row) => row.offsetParent !== null)
+        .map((row) => String(row.dataset.bookmarkSelectionKey || "").trim())
+        .filter(Boolean);
+}
+
+function getSelectedStarredPromptEntries() {
+    const selectedKeySet = new Set(selectedStarredPromptKeys);
+    return (starredPromptEntries || []).filter((entry) =>
+        selectedKeySet.has(getStarredPromptEntrySelectionKey(entry))
+    );
+}
+
+function getBookmarkTagById(tagId) {
+    return (bookmarkTags || []).find((tag) => String(tag.id) === String(tagId)) || null;
+}
+
+function getBookmarkWorkspaceSelectionSummary() {
+    const selectedCount = selectedDirectoryPromptKeys.length;
+    if (selectedCount > 0) {
+        return `サイドバーで ${selectedCount} 件選択中`;
     }
-    const groups = [];
-    const groupMap = new Map();
-    starredPromptEntries.forEach((entry) => {
-        const groupKey = String(entry.parentConversationId || entry.targetId || `group-${groups.length}`);
-        if (!groupMap.has(groupKey)) {
-            const sourceClass = getConversationSourceClass({
-                source: entry.source || "",
-            });
-            groupMap.set(groupKey, {
-                key: groupKey,
-                parentConversationId: entry.parentConversationId || "",
-                threadTitle: entry.threadTitle || "Untitled",
-                sourceClass,
-                updatedLabel: formatFilterHistoryDate(entry.updatedAt || entry.createdAt || ""),
-                entries: [],
-            });
-            groups.push(groupMap.get(groupKey));
+    return "サイドバーのフォルダや prompt を直接ドラッグ";
+}
+
+function getBookmarkWorkspaceScopeLabel(entries, fallbackLabel = "この対象") {
+    const normalizedEntries = Array.isArray(entries) ? entries.filter(Boolean) : [];
+    if (!normalizedEntries.length) {
+        return fallbackLabel;
+    }
+    return normalizedEntries.length === 1
+        ? "この prompt"
+        : `${normalizedEntries.length} 件の prompt`;
+}
+
+function entryHasBookmarkTag(entry, tagId) {
+    return Array.isArray(entry?.tags) && entry.tags.some((tag) => String(tag?.id) === String(tagId));
+}
+
+function getFilteredStarredPromptEntries() {
+    const selectedFilterIds = Array.isArray(selectedBookmarkTagFilterIds)
+        ? selectedBookmarkTagFilterIds.map((id) => String(id))
+        : [];
+    if (!selectedFilterIds.length) {
+        return Array.isArray(starredPromptEntries) ? starredPromptEntries.slice() : [];
+    }
+    return (starredPromptEntries || []).filter((entry) =>
+        selectedFilterIds.every((tagId) => entryHasBookmarkTag(entry, tagId))
+    );
+}
+
+function restoreBookmarkTagFilters(filterIds) {
+    selectedBookmarkTagFilterIds = Array.from(
+        new Set(
+            (Array.isArray(filterIds) ? filterIds : [])
+                .map((id) => String(id || "").trim())
+                .filter(Boolean)
+        )
+    );
+}
+
+function syncStarredPromptSelectionControls() {
+    const summaryNode = document.getElementById("starred-prompts-selection-summary");
+    const filterSummaryNode = document.getElementById("starred-prompts-filter-summary");
+    if (summaryNode) {
+        summaryNode.textContent = getBookmarkWorkspaceSelectionSummary();
+    }
+    if (filterSummaryNode) {
+        filterSummaryNode.textContent = selectedBookmarkTagFilterIds.length > 0
+            ? `${selectedBookmarkTagFilterIds.length}個のタグで絞り込み中`
+            : "タグボタンはフィルタ専用 / 複数選択は AND";
+    }
+}
+
+function syncStarredPromptSelectionClasses(options = {}) {
+    const rows = Array.from(document.querySelectorAll(".extract-history-prompt-row[data-bookmark-selection-key]"));
+    const visibleKeys = rows
+        .filter((row) => row.offsetParent !== null)
+        .map((row) => String(row.dataset.bookmarkSelectionKey || "").trim())
+        .filter(Boolean);
+    if (options.pruneToVisible) {
+        const visibleKeySet = new Set(visibleKeys);
+        selectedStarredPromptKeys = selectedStarredPromptKeys.filter((key) => visibleKeySet.has(key));
+        if (
+            starredPromptSelectionAnchorKey &&
+            !visibleKeySet.has(starredPromptSelectionAnchorKey)
+        ) {
+            starredPromptSelectionAnchorKey = selectedStarredPromptKeys[0] || "";
         }
-        groupMap.get(groupKey).entries.push(entry);
+    }
+    const selectedKeySet = new Set(selectedStarredPromptKeys);
+    rows.forEach((row) => {
+        const selectionKey = String(row.dataset.bookmarkSelectionKey || "").trim();
+        const isSelected = selectedKeySet.has(selectionKey);
+        row.classList.toggle("is-selected", isSelected);
+        row.setAttribute("aria-selected", isSelected ? "true" : "false");
+        const selectButton = row.querySelector(".extract-history-prompt-select");
+        if (selectButton) {
+            selectButton.setAttribute("aria-pressed", isSelected ? "true" : "false");
+        }
     });
-    return groups.map((group) => {
-        const starredPromptCount = getConversationStarredPromptCount(group.parentConversationId || "");
-        const promptRows = group.entries.map((entry) => {
-            const updatedAt = formatFilterHistoryDate(entry.updatedAt || entry.createdAt || "");
-            const convId = escapeJsString(entry.parentConversationId || "");
-            const messageIndex = Number.isInteger(entry.messageIndex) ? entry.messageIndex : -1;
-            const targetSpec = buildBookmarkTargetSpec(entry.targetType, entry.targetId, entry.payload || {});
-            return `
-                <div class="extract-history-prompt-row ${entry.bookmarked === false ? "is-restorable" : ""}">
-                    <div class="extract-history-prompt-main">
-                        <span class="extract-history-label">${escapeHTML(entry.title || entry.label || "Starred Prompt")}</span>
-                        <span class="extract-history-date">${escapeHTML(updatedAt ? `updated ${updatedAt}` : "")}</span>
-                    </div>
-                    <div class="extract-history-tools">
-                        <button class="extract-history-btn" type="button" onclick="jumpToStarredPrompt('${convId}', ${messageIndex})">開く</button>
-                        ${buildBookmarkToggleButtonHtml(
-                            targetSpec,
-                            entry.bookmarked !== false,
-                            `toggleStarredPromptCard('${escapeJsString(entry.targetId || "")}', event)`,
-                            "prompt-bookmark-btn",
-                            {
-                                activeTitle: "ブックマークを外す",
-                                inactiveTitle: "元に戻す",
-                            }
-                        )}
-                    </div>
+    syncStarredPromptSelectionControls();
+}
+
+function setStarredPromptSelection(keys, options = {}) {
+    const uniqueKeys = Array.from(
+        new Set(
+            (Array.isArray(keys) ? keys : [])
+                .map((key) => String(key || "").trim())
+                .filter(Boolean)
+        )
+    );
+    selectedStarredPromptKeys = uniqueKeys;
+    if (Object.prototype.hasOwnProperty.call(options, "anchorKey")) {
+        starredPromptSelectionAnchorKey = String(options.anchorKey || "").trim();
+    } else if (!uniqueKeys.length) {
+        starredPromptSelectionAnchorKey = "";
+    } else if (!starredPromptSelectionAnchorKey) {
+        starredPromptSelectionAnchorKey = uniqueKeys[0];
+    }
+    syncStarredPromptSelectionClasses();
+    return uniqueKeys;
+}
+
+function selectStarredPromptRange(targetKey) {
+    const normalizedTargetKey = String(targetKey || "").trim();
+    if (!normalizedTargetKey) return [];
+    if (!starredPromptSelectionAnchorKey) {
+        return setStarredPromptSelection([normalizedTargetKey], {
+            anchorKey: normalizedTargetKey,
+        });
+    }
+    const visibleKeys = getVisibleStarredPromptSelectionKeys();
+    const anchorIndex = visibleKeys.indexOf(starredPromptSelectionAnchorKey);
+    const targetIndex = visibleKeys.indexOf(normalizedTargetKey);
+    if (anchorIndex < 0 || targetIndex < 0) {
+        return setStarredPromptSelection([normalizedTargetKey], {
+            anchorKey: normalizedTargetKey,
+        });
+    }
+    const startIndex = Math.min(anchorIndex, targetIndex);
+    const endIndex = Math.max(anchorIndex, targetIndex);
+    return setStarredPromptSelection(visibleKeys.slice(startIndex, endIndex + 1), {
+        anchorKey: starredPromptSelectionAnchorKey,
+    });
+}
+
+function selectStarredPromptEntry(targetKey, event) {
+    if (Date.now() < bookmarkSelectionSuppressClickUntil) {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        return;
+    }
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const normalizedTargetKey = String(targetKey || "").trim();
+    if (!normalizedTargetKey) return;
+    if (event?.shiftKey) {
+        selectStarredPromptRange(normalizedTargetKey);
+        return;
+    }
+    setStarredPromptSelection([normalizedTargetKey], {
+        anchorKey: normalizedTargetKey,
+    });
+}
+
+function buildStarredPromptManagerControlsHtml() {
+    const regularTags = bookmarkTags || [];
+    const activeFilterSet = new Set((selectedBookmarkTagFilterIds || []).map((id) => String(id)));
+    return `
+        <div class="manager-tab-toolbar">
+            <div class="manager-tab-toolbar-left">
+                <div class="manager-tab-toolbar-meta">
+                    <span class="manager-tab-toolbar-title">タグ操作台</span>
+                    <span class="manager-tab-toolbar-summary" id="starred-prompts-selection-summary">${getBookmarkWorkspaceSelectionSummary()}</span>
                 </div>
-            `;
-        }).join("");
-        return `
-            <article class="extract-history-item extract-history-item-starred-prompt">
-                <div class="extract-history-meta extract-history-meta-thread-card">
-                    <div class="extract-history-meta-main">
-                        <div class="extract-history-thread-row">
-                            ${getCountFolderBadgeHtml(
-                                starredPromptCount,
-                                group.sourceClass,
-                                "extract-history-thread-badge",
-                                "Starred prompts in this thread"
-                            )}
-                            <span class="extract-history-thread-title extract-history-thread-title-starred-prompt">${escapeHTML(group.threadTitle)}</span>
-                        </div>
-                        <span class="extract-history-date">${escapeHTML(group.updatedLabel ? `updated ${group.updatedLabel}` : "")}</span>
-                    </div>
+            </div>
+            <div class="bookmark-tag-panel">
+                <div class="manager-tab-toolbar-meta bookmark-tag-filter-meta">
+                    <span class="manager-tab-toolbar-title">タグ</span>
+                    <span class="manager-tab-toolbar-summary" id="starred-prompts-filter-summary">${
+                        activeFilterSet.size > 0
+                            ? `${activeFilterSet.size}個のタグで絞り込み中`
+                            : "タグボタンはフィルタ専用 / 複数選択は AND"
+                    }</span>
                 </div>
-                <div class="extract-history-prompt-list">
-                    ${promptRows}
+                <div class="bookmark-tag-create">
+                    <input id="bookmark-tag-name-input" type="text" placeholder="新しいタグ" onkeydown="handleBookmarkTagCreateKeydown(event)">
+                    <button class="extract-history-btn" type="button" onclick="createBookmarkTagFromInput()">タグを作成</button>
+                    <button
+                        class="extract-history-btn"
+                        type="button"
+                        onclick="clearBookmarkTagFilters(event)"
+                        ${activeFilterSet.size > 0 ? "" : "disabled"}
+                    >絞り込み解除</button>
                 </div>
-            </article>
-        `;
-    }).join("");
+                <div class="bookmark-tag-dropzones">
+                    ${(regularTags || []).map((tag) => `
+                        <button
+                            class="bookmark-tag-dropzone ${activeFilterSet.has(String(tag.id)) ? "is-filter-active" : ""}"
+                            type="button"
+                            data-bookmark-dropzone-kind="assign-tag"
+                            data-bookmark-tag-id="${escapeHTML(String(tag.id))}"
+                            aria-pressed="${activeFilterSet.has(String(tag.id)) ? "true" : "false"}"
+                            title="クリックで絞り込み / タグをサイドバーへ落とすと付与 / サイドバーの対象をここへ落としても付与"
+                            onclick="toggleBookmarkTagFilter(${Number.parseInt(tag.id, 10)}, event)"
+                            onpointerdown="armBookmarkTagDrag(${Number.parseInt(tag.id, 10)}, event)"
+                        >
+                            <span class="bookmark-tag-dropzone-label">${escapeHTML(tag.name || "Tag")}</span>
+                            <span class="bookmark-tag-dropzone-count">${escapeHTML(String(tag.bookmarkCount || 0))}</span>
+                        </button>
+                    `).join("")}
+                    <button
+                        class="bookmark-tag-dropzone bookmark-tag-dropzone-remove"
+                        type="button"
+                        data-bookmark-dropzone-kind="remove-tag"
+                        title="× をサイドバーへ落とすとタグ解除 / サイドバーの対象をここへ落とすとタグをまとめて外す / タグチップをドロップするとそのタグだけ外す"
+                        onpointerdown="armBookmarkRemoveToolDrag(event)"
+                    >
+                        <span class="bookmark-tag-dropzone-remove-icon" aria-hidden="true">×</span>
+                        <span class="bookmark-tag-dropzone-label">選択中からタグ解除</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function buildBookmarkTagWorkspaceMarkup() {
+    const activeFilterSet = new Set((selectedBookmarkTagFilterIds || []).map((id) => String(id)));
+    const activeTagNames = (bookmarkTags || [])
+        .filter((tag) => activeFilterSet.has(String(tag.id)))
+        .map((tag) => tag.name || "Tag");
+    const selectedCount = selectedDirectoryPromptKeys.length;
+    return `
+        <div class="bookmark-workspace">
+            <section class="bookmark-workspace-card">
+                <h3 class="bookmark-workspace-title">操作対象</h3>
+                <p class="bookmark-workspace-summary">${
+                    selectedCount > 0
+                        ? `サイドバーで選んだ ${selectedCount} 件の prompt をまとめて操作できるよ。`
+                        : "サイドバーのフォルダや prompt をタグボタンか × にドラッグして操作してね。"
+                }</p>
+                <div class="bookmark-workspace-chip-list">
+                    <span class="bookmark-workspace-chip">Shift+クリックで範囲選択</span>
+                    <span class="bookmark-workspace-chip">フォルダは今見えている prompt 全体</span>
+                </div>
+            </section>
+            <section class="bookmark-workspace-card">
+                <h3 class="bookmark-workspace-title">使い方</h3>
+                <ul class="bookmark-workspace-list">
+                    <li>タグボタン → サイドバー: そのフォルダや prompt にタグ付与</li>
+                    <li>サイドバー → タグボタン: 選んだ対象へタグ付与</li>
+                    <li>サイドバー → ×: 対象についているタグをまとめて解除</li>
+                </ul>
+            </section>
+            <section class="bookmark-workspace-card">
+                <h3 class="bookmark-workspace-title">フィルタ</h3>
+                <p class="bookmark-workspace-summary">${
+                    activeTagNames.length
+                        ? `いまは ${activeTagNames.join(" / ")} で AND 絞り込み中。`
+                        : "タグボタンのクリックはフィルタ専用。複数タグは AND で効くよ。"
+                }</p>
+            </section>
+        </div>
+    `;
 }
 
 function renderRecentFilters() {
@@ -6367,6 +7740,24 @@ async function refreshStarredFilters() {
 
 async function refreshStarredPrompts() {
     starredPromptEntries = await requestStarredPrompts();
+    const visiblePromptTargetIds = new Set(
+        (starredPromptEntries || [])
+            .map((entry) => String(entry?.targetId || "").trim())
+            .filter(Boolean)
+    );
+    Object.keys(bookmarkStatesByKey).forEach((stateKey) => {
+        const state = bookmarkStatesByKey[stateKey];
+        if (
+            state?.targetType === "prompt"
+            && !visiblePromptTargetIds.has(String(state?.targetId || "").trim())
+        ) {
+            cacheBookmarkState({
+                ...state,
+                bookmarked: false,
+                tags: [],
+            });
+        }
+    });
     (starredPromptEntries || []).forEach((entry) => {
         cacheBookmarkState({
             targetType: entry.targetType,
@@ -6374,12 +7765,795 @@ async function refreshStarredPrompts() {
             payload: entry.payload || {},
             bookmarked: entry.bookmarked !== false,
             updatedAt: entry.updatedAt || null,
+            tags: Array.isArray(entry.tags) ? entry.tags : [],
         });
     });
-    bookmarkListEntries = starredPromptEntries;
+    syncConversationTagCountsFromStarredPrompts();
     if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
         renderActiveTab();
     }
+    renderTree();
+    refreshCurrentTabStrip();
+}
+
+async function refreshBookmarkTags() {
+    bookmarkTags = await requestBookmarkTags();
+    const visibleTagIds = new Set((bookmarkTags || []).map((tag) => String(tag.id)));
+    selectedBookmarkTagFilterIds = selectedBookmarkTagFilterIds.filter((tagId) => visibleTagIds.has(String(tagId)));
+    const visibleTagNames = new Set((bookmarkTags || []).map((tag) => String(tag.name || "").trim()).filter(Boolean));
+    writeExtractMultiValue(
+        "extract-bookmark-tags",
+        getSelectedExtractBookmarkTags().filter((tagName) => visibleTagNames.has(String(tagName || "").trim()))
+    );
+    renderExtractBookmarkTagMenu();
+    syncExtractBookmarkTagTrigger();
+    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+        renderActiveTab();
+    }
+}
+
+function buildSelectedStarredPromptTargets() {
+    return getSelectedStarredPromptEntries().map((entry) => ({
+        targetType: entry.targetType,
+        targetId: entry.targetId,
+        payload: entry.payload || {},
+    }));
+}
+
+function getSelectedStarredPromptTagSummaries() {
+    const tagMap = new Map();
+    getSelectedStarredPromptEntries().forEach((entry) => {
+        (Array.isArray(entry.tags) ? entry.tags : []).forEach((tag) => {
+            const tagId = String(tag?.id || "").trim();
+            if (!tagId) return;
+            if (!tagMap.has(tagId)) {
+                tagMap.set(tagId, {
+                    tagId,
+                    tagName: tag?.name || "",
+                });
+            }
+        });
+    });
+    return Array.from(tagMap.values());
+}
+
+function clearBookmarkSelectionDropzones() {
+    document.querySelectorAll(".bookmark-tag-dropzone.is-drag-over, .prompt-item-row.is-drag-over, .tree-summary.is-drag-over").forEach((node) => {
+        node.classList.remove("is-drag-over");
+    });
+}
+
+function finishStarredPromptDrag(_event) {
+    bookmarkSelectionDragState = null;
+    document.body.classList.remove("bookmark-dragging");
+    clearBookmarkSelectionDropzones();
+    if (bookmarkSelectionDragGhostEl?.parentNode) {
+        bookmarkSelectionDragGhostEl.parentNode.removeChild(bookmarkSelectionDragGhostEl);
+    }
+    bookmarkSelectionDragGhostEl = null;
+}
+
+function armStarredPromptDrag(selectionKey, event) {
+    if ((event?.button ?? 0) !== 0) return;
+    const normalizedKey = String(selectionKey || "").trim();
+    if (!normalizedKey) return;
+    const selectedKeys = selectedStarredPromptKeys.includes(normalizedKey)
+        ? selectedStarredPromptKeys.slice()
+        : [normalizedKey];
+    bookmarkSelectionDragState = {
+        dragKind: "bookmark-selection",
+        selectionKey: normalizedKey,
+        selectedKeys,
+        filterIdsSnapshot: selectedBookmarkTagFilterIds.slice(),
+        startX: event?.clientX ?? 0,
+        startY: event?.clientY ?? 0,
+        active: false,
+        hoverKind: "",
+        hoverTagId: "",
+    };
+}
+
+function armBookmarkTagDrag(tagId, event) {
+    if ((event?.button ?? 0) !== 0) return;
+    const tag = getBookmarkTagById(tagId);
+    if (!tag) return;
+    bookmarkSelectionDragState = {
+        dragKind: "tag",
+        tagId: String(tag.id),
+        tagName: tag.name || "",
+        filterIdsSnapshot: selectedBookmarkTagFilterIds.slice(),
+        startX: event?.clientX ?? 0,
+        startY: event?.clientY ?? 0,
+        active: false,
+        hoverKind: "",
+        hoverTagId: "",
+    };
+}
+
+function armBookmarkRemoveToolDrag(event) {
+    if ((event?.button ?? 0) !== 0) return;
+    bookmarkSelectionDragState = {
+        dragKind: "tag-remove-tool",
+        startX: event?.clientX ?? 0,
+        startY: event?.clientY ?? 0,
+        filterIdsSnapshot: selectedBookmarkTagFilterIds.slice(),
+        active: false,
+        hoverKind: "",
+        hoverTagId: "",
+    };
+}
+
+function armBookmarkEntryTagDrag(tagId, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    armBookmarkTagDrag(tagId, event);
+}
+
+function ensureBookmarkSelectionDragGhost(label) {
+    if (!bookmarkSelectionDragGhostEl) {
+        const ghost = document.createElement("div");
+        ghost.className = "bookmark-drag-ghost";
+        document.body.appendChild(ghost);
+        bookmarkSelectionDragGhostEl = ghost;
+    }
+    bookmarkSelectionDragGhostEl.textContent = label;
+}
+
+function isValidBookmarkDropTarget(dragKind, hoverKind) {
+    if (dragKind === "bookmark-selection") {
+        return hoverKind === "assign-tag" || hoverKind === "remove-tag";
+    }
+    if (dragKind === "directory-prompt-selection" || dragKind === "directory-folder") {
+        return hoverKind === "assign-tag" || hoverKind === "remove-tag";
+    }
+    if (dragKind === "tag") {
+        return (
+            hoverKind === "remove-tag" ||
+            hoverKind === "directory-prompt" ||
+            hoverKind === "directory-folder"
+        );
+    }
+    if (dragKind === "tag-remove-tool") {
+        return hoverKind === "directory-prompt" || hoverKind === "directory-folder";
+    }
+    return false;
+}
+
+function updateBookmarkSelectionDropTarget(clientX, clientY) {
+    const hovered = document
+        .elementFromPoint(clientX, clientY)
+        ?.closest(".bookmark-tag-dropzone, .prompt-item-row[data-directory-drop-kind], .tree-summary[data-directory-drop-kind]");
+    clearBookmarkSelectionDropzones();
+    if (!hovered) {
+        if (bookmarkSelectionDragState) {
+            bookmarkSelectionDragState.hoverKind = "";
+            bookmarkSelectionDragState.hoverTagId = "";
+            bookmarkSelectionDragState.hoverDirectoryConvIdx = "";
+            bookmarkSelectionDragState.hoverDirectoryMsgIdx = "";
+        }
+        return;
+    }
+    if (bookmarkSelectionDragState) {
+        const hoverKind = String(
+            hovered.dataset.bookmarkDropzoneKind || hovered.dataset.directoryDropKind || ""
+        );
+        const hoverTagId = String(hovered.dataset.bookmarkTagId || "");
+        const hoverDirectoryConvIdx = String(hovered.dataset.directoryConvIdx || "");
+        const hoverDirectoryMsgIdx = String(hovered.dataset.directoryMsgIdx || "");
+        if (isValidBookmarkDropTarget(bookmarkSelectionDragState.dragKind, hoverKind)) {
+            hovered.classList.add("is-drag-over");
+            bookmarkSelectionDragState.hoverKind = hoverKind;
+            bookmarkSelectionDragState.hoverTagId = hoverTagId;
+            bookmarkSelectionDragState.hoverDirectoryConvIdx = hoverDirectoryConvIdx;
+            bookmarkSelectionDragState.hoverDirectoryMsgIdx = hoverDirectoryMsgIdx;
+        } else {
+            bookmarkSelectionDragState.hoverKind = "";
+            bookmarkSelectionDragState.hoverTagId = "";
+            bookmarkSelectionDragState.hoverDirectoryConvIdx = "";
+            bookmarkSelectionDragState.hoverDirectoryMsgIdx = "";
+        }
+    }
+}
+
+function handleBookmarkSelectionPointerMove(event) {
+    if (!bookmarkSelectionDragState) return;
+    const pointerX = event?.clientX ?? 0;
+    const pointerY = event?.clientY ?? 0;
+    if (!bookmarkSelectionDragState.active) {
+        const dx = pointerX - bookmarkSelectionDragState.startX;
+        const dy = pointerY - bookmarkSelectionDragState.startY;
+        if (Math.hypot(dx, dy) < BOOKMARK_SELECTION_DRAG_THRESHOLD) {
+            return;
+        }
+        if (bookmarkSelectionDragState.dragKind === "bookmark-selection") {
+            setStarredPromptSelection(bookmarkSelectionDragState.selectedKeys, {
+                anchorKey: bookmarkSelectionDragState.selectionKey,
+            });
+            ensureBookmarkSelectionDragGhost(`${bookmarkSelectionDragState.selectedKeys.length}件のprompt`);
+        } else if (bookmarkSelectionDragState.dragKind === "directory-prompt-selection") {
+            setDirectoryPromptSelection(bookmarkSelectionDragState.selectedKeys, {
+                anchorKey: bookmarkSelectionDragState.selectionKey,
+            });
+            ensureBookmarkSelectionDragGhost(`${bookmarkSelectionDragState.selectedKeys.length}件のprompt`);
+        } else if (bookmarkSelectionDragState.dragKind === "directory-folder") {
+            ensureBookmarkSelectionDragGhost("このフォルダのprompt");
+        } else if (bookmarkSelectionDragState.dragKind === "tag-remove-tool") {
+            ensureBookmarkSelectionDragGhost("タグ解除");
+        } else {
+            ensureBookmarkSelectionDragGhost(`タグ「${bookmarkSelectionDragState.tagName || ""}」`);
+        }
+        bookmarkSelectionDragState.active = true;
+        document.body.classList.add("bookmark-dragging");
+    }
+    if (bookmarkSelectionDragGhostEl) {
+        bookmarkSelectionDragGhostEl.style.transform = `translate(${pointerX + 16}px, ${pointerY + 16}px)`;
+    }
+    updateBookmarkSelectionDropTarget(pointerX, pointerY);
+    event?.preventDefault?.();
+}
+
+async function handleBookmarkSelectionPointerUp(event) {
+    if (!bookmarkSelectionDragState) return;
+    const dragState = {
+        ...bookmarkSelectionDragState,
+        selectedKeys: Array.isArray(bookmarkSelectionDragState.selectedKeys)
+            ? bookmarkSelectionDragState.selectedKeys.slice()
+            : [],
+    };
+    const wasActive = Boolean(bookmarkSelectionDragState.active);
+    const dragKind = bookmarkSelectionDragState.dragKind;
+    const dragTagId = bookmarkSelectionDragState.tagId;
+    const filterIdsSnapshot = Array.isArray(bookmarkSelectionDragState.filterIdsSnapshot)
+        ? bookmarkSelectionDragState.filterIdsSnapshot.slice()
+        : [];
+    const hoverKind = bookmarkSelectionDragState.hoverKind;
+    const hoverTagId = bookmarkSelectionDragState.hoverTagId;
+    const hoverDirectoryConvIdx = Number.parseInt(bookmarkSelectionDragState.hoverDirectoryConvIdx || "", 10);
+    const hoverDirectoryMsgIdx = Number.parseInt(bookmarkSelectionDragState.hoverDirectoryMsgIdx || "", 10);
+    finishStarredPromptDrag(event);
+    if (!wasActive) return;
+    bookmarkSelectionSuppressClickUntil = Date.now() + 900;
+    bookmarkTagFilterClickSuppressUntil = Date.now() + 900;
+    if (dragKind === "bookmark-selection" && hoverKind === "assign-tag" && hoverTagId) {
+        await applySelectedBookmarksToTag(hoverTagId);
+        restoreBookmarkTagFilters(filterIdsSnapshot);
+        if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+            renderActiveTab();
+        }
+        return;
+    }
+    if (dragKind === "bookmark-selection" && hoverKind === "remove-tag") {
+        await removeAllTagsFromSelectedBookmarks();
+        restoreBookmarkTagFilters(filterIdsSnapshot);
+        if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+            renderActiveTab();
+        }
+        return;
+    }
+    if (dragKind === "tag" && hoverKind === "remove-tag") {
+        await removeDraggedTagFromSelectedBookmarks(dragTagId || hoverTagId);
+        restoreBookmarkTagFilters(filterIdsSnapshot);
+        if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+            renderActiveTab();
+        }
+        return;
+    }
+    if (dragKind === "tag" && hoverKind === "directory-prompt" && Number.isInteger(hoverDirectoryConvIdx) && Number.isInteger(hoverDirectoryMsgIdx)) {
+        await applyTagToDirectoryPrompt(dragTagId, hoverDirectoryConvIdx, hoverDirectoryMsgIdx);
+        restoreBookmarkTagFilters(filterIdsSnapshot);
+        return;
+    }
+    if (dragKind === "tag" && hoverKind === "directory-folder" && Number.isInteger(hoverDirectoryConvIdx)) {
+        await applyTagToDirectoryFolder(dragTagId, hoverDirectoryConvIdx);
+        restoreBookmarkTagFilters(filterIdsSnapshot);
+        return;
+    }
+    if (dragKind === "tag-remove-tool" && hoverKind === "directory-prompt" && Number.isInteger(hoverDirectoryConvIdx) && Number.isInteger(hoverDirectoryMsgIdx)) {
+        await removeTagsFromDirectoryPrompt(hoverDirectoryConvIdx, hoverDirectoryMsgIdx);
+        restoreBookmarkTagFilters(filterIdsSnapshot);
+        return;
+    }
+    if (dragKind === "tag-remove-tool" && hoverKind === "directory-folder" && Number.isInteger(hoverDirectoryConvIdx)) {
+        await removeTagsFromDirectoryFolder(hoverDirectoryConvIdx);
+        restoreBookmarkTagFilters(filterIdsSnapshot);
+        return;
+    }
+    if (
+        (dragKind === "directory-prompt-selection" || dragKind === "directory-folder") &&
+        hoverKind === "assign-tag" &&
+        hoverTagId
+    ) {
+        const entries = await resolveDirectoryPromptDragEntries(dragState);
+        await applyTagToPromptEntries(
+            hoverTagId,
+            entries,
+            getBookmarkWorkspaceScopeLabel(entries, dragKind === "directory-folder" ? "このフォルダ" : "選択中")
+        );
+        restoreBookmarkTagFilters(filterIdsSnapshot);
+        if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+            renderActiveTab();
+        }
+        return;
+    }
+    if (
+        (dragKind === "directory-prompt-selection" || dragKind === "directory-folder") &&
+        hoverKind === "remove-tag"
+    ) {
+        const entries = await resolveDirectoryPromptDragEntries(dragState);
+        await removeTagsFromPromptEntries(
+            entries,
+            getBookmarkWorkspaceScopeLabel(entries, dragKind === "directory-folder" ? "このフォルダ" : "選択中")
+        );
+        restoreBookmarkTagFilters(filterIdsSnapshot);
+        if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+            renderActiveTab();
+        }
+    }
+}
+
+function ensureBookmarkSelectionDragInteractions() {
+    if (bookmarkSelectionDragBound) return;
+    bookmarkSelectionDragBound = true;
+    document.addEventListener("pointermove", (event) => {
+        void handleBookmarkSelectionPointerMove(event);
+    });
+    document.addEventListener("pointerup", (event) => {
+        void handleBookmarkSelectionPointerUp(event);
+    });
+    document.addEventListener("pointercancel", (event) => {
+        finishStarredPromptDrag(event);
+    });
+    window.addEventListener("blur", () => {
+        finishStarredPromptDrag();
+    });
+}
+
+async function applySelectedBookmarksToTag(tagId) {
+    const tag = getBookmarkTagById(tagId);
+    const targets = buildSelectedStarredPromptTargets();
+    if (!tag || !targets.length) {
+        showToast("先に prompt を選んでね");
+        return;
+    }
+    const result = await requestBookmarkTagMembership(tag.id, targets, true);
+    if ((result?.affected || 0) > 0) {
+        pushBookmarkUndoAction({
+            type: "tag-membership",
+            tagId: String(tag.id),
+            tagName: tag.name || "",
+            targets,
+            assigned: true,
+        });
+    }
+    await refreshBookmarkTags();
+    await refreshStarredPrompts();
+    if ((result?.affected || 0) <= 0) {
+        showToast(`タグ「${tag.name}」はもう全部についてるよ`);
+        return;
+    }
+    showToast(`タグ「${tag.name}」を ${result?.affected || 0} 件に付けたよ`);
+}
+
+async function resolveDirectoryPromptEntry(convIdx, messageIndex) {
+    if (!Number.isInteger(convIdx) || convIdx < 0 || !Number.isInteger(messageIndex) || messageIndex < 0) {
+        return null;
+    }
+    const conv = await loadConversationDetail(convIdx).catch(() => null);
+    const message = conv?.messages?.[messageIndex];
+    if (!conv?.id || message?.role !== "user") {
+        return null;
+    }
+    const bookmarkTarget = buildPromptBookmarkTargetSpec(conv, messageIndex, message.text || "");
+    let currentState = getCachedBookmarkState(bookmarkTarget);
+    if (!currentState) {
+        await requestBookmarkStates([bookmarkTarget]);
+        currentState = getCachedBookmarkState(bookmarkTarget);
+    }
+    return {
+        selectionKey: buildDirectoryPromptSelectionKey(conv.id, messageIndex),
+        conv,
+        convIdx,
+        messageIndex,
+        bookmarkTarget,
+        currentState,
+    };
+}
+
+async function ensurePromptEntriesBookmarked(entries) {
+    const entriesNeedingBookmark = (Array.isArray(entries) ? entries : []).filter(
+        (entry) => !Boolean(entry?.currentState?.bookmarked)
+    );
+    if (!entriesNeedingBookmark.length) {
+        return;
+    }
+    await applyPromptBookmarkState(entriesNeedingBookmark, true);
+}
+
+async function applyTagToPromptEntries(tagId, entries, scopeLabel) {
+    const tag = getBookmarkTagById(tagId);
+    const normalizedEntries = (Array.isArray(entries) ? entries : []).filter(Boolean);
+    if (!tag || !normalizedEntries.length) {
+        showToast("タグ付けできる対象がないよ");
+        return;
+    }
+    await ensurePromptEntriesBookmarked(normalizedEntries);
+    const targets = normalizedEntries.map((entry) => entry.bookmarkTarget);
+    const result = await requestBookmarkTagMembership(tag.id, targets, true);
+    if ((result?.affected || 0) > 0) {
+        pushBookmarkUndoAction({
+            type: "tag-membership",
+            tagId: String(tag.id),
+            tagName: tag.name || "",
+            targets,
+            assigned: true,
+        });
+    }
+    await refreshBookmarkTags();
+    await refreshStarredPrompts();
+    renderTree();
+    if ((result?.affected || 0) <= 0) {
+        showToast(`${scopeLabel}にはもうタグ「${tag.name}」がついてるよ`);
+        return;
+    }
+    showToast(`${scopeLabel}にタグ「${tag.name}」を付けたよ`);
+}
+
+async function applyTagToDirectoryPrompt(tagId, convIdx, messageIndex) {
+    const entry = await resolveDirectoryPromptEntry(convIdx, messageIndex);
+    if (!entry) {
+        showToast("この prompt には付けられなかったよ");
+        return;
+    }
+    await applyTagToPromptEntries(tagId, [entry], "この prompt");
+}
+
+async function applyTagToDirectoryFolder(tagId, convIdx) {
+    const entries = await resolveVisibleConversationPromptEntries(convIdx);
+    if (!entries.length) {
+        showToast("このフォルダに対象の prompt はないよ");
+        return;
+    }
+    await applyTagToPromptEntries(tagId, entries, `このフォルダの ${entries.length} 件`);
+}
+
+async function removeDraggedTagFromSelectedBookmarks(tagId) {
+    const tag = getBookmarkTagById(tagId);
+    const targets = buildSelectedStarredPromptTargets();
+    if (!tag || !targets.length) {
+        showToast("先に prompt を選んでね");
+        return;
+    }
+    const result = await requestBookmarkTagMembership(tag.id, targets, false);
+    if ((result?.affected || 0) > 0) {
+        pushBookmarkUndoAction({
+            type: "tag-membership",
+            tagId: String(tag.id),
+            tagName: tag.name || "",
+            targets,
+            assigned: false,
+        });
+    }
+    await refreshBookmarkTags();
+    await refreshStarredPrompts();
+    if ((result?.affected || 0) <= 0) {
+        showToast(`選択中にはタグ「${tag.name}」がついていないよ`);
+        return;
+    }
+    showToast(`タグ「${tag.name}」を ${result?.affected || 0} 件から外したよ`);
+}
+
+async function removeTagsFromPromptEntries(entries, scopeLabel) {
+    const normalizedEntries = (Array.isArray(entries) ? entries : []).filter(Boolean);
+    if (!normalizedEntries.length) {
+        showToast("タグ解除できる対象がないよ");
+        return;
+    }
+    const targets = normalizedEntries.map((entry) => entry.bookmarkTarget);
+    const tagSummaries = [];
+    normalizedEntries.forEach((entry) => {
+        const entryState = (starredPromptEntries || []).find(
+            (item) => String(item.targetId || "") === String(entry.bookmarkTarget.targetId || "")
+        );
+        (Array.isArray(entryState?.tags) ? entryState.tags : []).forEach((tag) => {
+            const nextTagId = String(tag?.id || "").trim();
+            if (!nextTagId || tagSummaries.some((item) => item.tagId === nextTagId)) {
+                return;
+            }
+            tagSummaries.push({
+                tagId: nextTagId,
+                tagName: tag?.name || "",
+            });
+        });
+    });
+    if (!tagSummaries.length) {
+        showToast(`${scopeLabel}に外せるタグはないよ`);
+        return;
+    }
+
+    const undoItems = [];
+    for (const summary of tagSummaries) {
+        const result = await requestBookmarkTagMembership(summary.tagId, targets, false);
+        if ((result?.affected || 0) > 0) {
+            undoItems.push({
+                tagId: summary.tagId,
+                tagName: summary.tagName,
+                targets,
+                assigned: false,
+            });
+        }
+    }
+
+    await refreshBookmarkTags();
+    await refreshStarredPrompts();
+    renderTree();
+    if (!undoItems.length) {
+        showToast(`${scopeLabel}に外せるタグはないよ`);
+        return;
+    }
+    pushBookmarkUndoAction({
+        type: "tag-membership-batch",
+        items: undoItems,
+    });
+    showToast(`${scopeLabel}のタグを外したよ`);
+}
+
+async function removeAllTagsFromSelectedBookmarks() {
+    const targets = buildSelectedStarredPromptTargets();
+    const tagSummaries = getSelectedStarredPromptTagSummaries();
+    if (!targets.length) {
+        showToast("先に prompt を選んでね");
+        return;
+    }
+    if (!tagSummaries.length) {
+        showToast("選択中に外せるタグはないよ");
+        return;
+    }
+
+    const undoItems = [];
+    let affectedTotal = 0;
+    for (const summary of tagSummaries) {
+        const result = await requestBookmarkTagMembership(summary.tagId, targets, false);
+        if ((result?.affected || 0) > 0) {
+            undoItems.push({
+                tagId: String(summary.tagId),
+                tagName: summary.tagName || "",
+                targets,
+                assigned: false,
+            });
+            affectedTotal += result.affected || 0;
+        }
+    }
+
+    await refreshBookmarkTags();
+    await refreshStarredPrompts();
+    if (!undoItems.length) {
+        showToast("選択中に外せるタグはないよ");
+        return;
+    }
+    pushBookmarkUndoAction({
+        type: "tag-membership-batch",
+        items: undoItems,
+    });
+    showToast(`選択中のタグを ${affectedTotal} 件ぶん外したよ`);
+}
+
+async function removeTagsFromDirectoryPrompt(convIdx, messageIndex) {
+    const entry = await resolveDirectoryPromptEntry(convIdx, messageIndex);
+    if (!entry) {
+        showToast("この prompt には外せるタグがないよ");
+        return;
+    }
+    await removeTagsFromPromptEntries([entry], "この prompt");
+}
+
+async function removeTagsFromDirectoryFolder(convIdx) {
+    const entries = await resolveVisibleConversationPromptEntries(convIdx);
+    if (!entries.length) {
+        showToast("このフォルダに対象の prompt はないよ");
+        return;
+    }
+    await removeTagsFromPromptEntries(entries, `このフォルダの ${entries.length} 件`);
+}
+
+function toggleBookmarkTagFilter(tagId, event) {
+    if (
+        Date.now() < bookmarkSelectionSuppressClickUntil ||
+        Date.now() < bookmarkTagFilterClickSuppressUntil
+    ) {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        return;
+    }
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const normalizedTagId = String(tagId || "").trim();
+    if (!normalizedTagId) return;
+    const nextIds = new Set((selectedBookmarkTagFilterIds || []).map((id) => String(id)));
+    if (nextIds.has(normalizedTagId)) {
+        nextIds.delete(normalizedTagId);
+    } else {
+        nextIds.add(normalizedTagId);
+    }
+    selectedBookmarkTagFilterIds = Array.from(nextIds);
+    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+        renderActiveTab();
+    }
+}
+
+function clearBookmarkTagFilters(event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (!selectedBookmarkTagFilterIds.length) return;
+    selectedBookmarkTagFilterIds = [];
+    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+        renderActiveTab();
+    }
+}
+
+function handleBookmarkTagCreateKeydown(event) {
+    if (event?.key !== "Enter") return;
+    event.preventDefault();
+    createBookmarkTagFromInput();
+}
+
+async function createBookmarkTagFromInput() {
+    const input = document.getElementById("bookmark-tag-name-input");
+    const name = String(input?.value || "").trim();
+    if (!name) {
+        showToast("タグ名を入れてね");
+        return;
+    }
+    const created = await requestCreateBookmarkTag(name);
+    if (!created?.id) {
+        showToast("タグを作れなかったよ");
+        return;
+    }
+    if (input) {
+        input.value = "";
+    }
+    pushBookmarkUndoAction({
+        type: "tag-create",
+        tagId: String(created.id),
+        tagName: created.name || name,
+    });
+    await refreshBookmarkTags();
+    showToast(`タグ「${created.name}」を作ったよ`);
+}
+
+function pushBookmarkUndoAction(action) {
+    if (!action || typeof action !== "object") return;
+    bookmarkUndoStack.push(action);
+    if (bookmarkUndoStack.length > BOOKMARK_UNDO_LIMIT) {
+        bookmarkUndoStack.shift();
+    }
+}
+
+function refreshBookmarkPromptChrome() {
+    renderTree();
+    refreshCurrentTabStrip();
+    const activeTab = getActiveTab();
+    if (activeTab?.type === "conversation") {
+        renderChat(activeTab.convIdx, { preserveTabStripScroll: true });
+    } else if (activeTab) {
+        renderActiveTab();
+    }
+    if (isSidebarFilterActive) {
+        refreshDirectoryFromExtractFilters(true).catch(() => {});
+    }
+}
+
+async function undoLastBookmarkAction() {
+    const action = bookmarkUndoStack.pop();
+    if (!action) {
+        showToast("戻せるマーク操作はまだないよ");
+        return;
+    }
+    if (action.type === "bookmark-state") {
+        const conversationDeltas = new Map();
+        await Promise.all(
+            (action.items || []).map(async (item) => {
+                const target = normalizeBookmarkTargetSpec(item.target);
+                await requestBookmarkChange(target, Boolean(item.beforeBookmarked));
+                const delta = (item.beforeBookmarked ? 1 : 0) - (item.afterBookmarked ? 1 : 0);
+                if (delta && item.parentConversationId) {
+                    conversationDeltas.set(
+                        item.parentConversationId,
+                        (conversationDeltas.get(item.parentConversationId) || 0) + delta
+                    );
+                }
+            })
+        );
+        conversationDeltas.forEach((delta, convId) => {
+            updateConversationStarredPromptCount(convId, delta);
+        });
+        refreshBookmarkPromptChrome();
+        await refreshStarredPrompts();
+        showToast("マーク操作を元に戻したよ");
+        return;
+    }
+    if (action.type === "tag-membership") {
+        await requestBookmarkTagMembership(action.tagId, action.targets || [], !action.assigned);
+        await refreshBookmarkTags();
+        await refreshStarredPrompts();
+        showToast(`タグ「${action.tagName || ""}」の操作を元に戻したよ`);
+        return;
+    }
+    if (action.type === "tag-membership-batch") {
+        for (const item of action.items || []) {
+            await requestBookmarkTagMembership(item.tagId, item.targets || [], !item.assigned);
+        }
+        await refreshBookmarkTags();
+        await refreshStarredPrompts();
+        showToast("タグ解除の操作を元に戻したよ");
+        return;
+    }
+    if (action.type === "tag-create") {
+        const result = await requestDeleteBookmarkTag(action.tagId);
+        await refreshBookmarkTags();
+        if ((result?.deleted || 0) > 0) {
+            showToast(`タグ「${action.tagName || ""}」の作成を取り消したよ`);
+        } else {
+            showToast("タグ作成の取り消しはできなかったよ");
+        }
+    }
+}
+
+async function applyStarredPromptBookmarkState(entries, nextBookmarked) {
+    const normalizedEntries = Array.isArray(entries) ? entries.filter(Boolean) : [];
+    if (!normalizedEntries.length) return;
+    const conversationDeltas = new Map();
+    const changedItems = [];
+    let didChange = false;
+    await Promise.all(
+        normalizedEntries.map(async (entry) => {
+            const bookmarkTarget = buildBookmarkTargetSpec(entry.targetType, entry.targetId, entry.payload || {});
+            const previousBookmarked = entry.bookmarked !== false;
+            if (previousBookmarked === Boolean(nextBookmarked)) return;
+            const result = await requestBookmarkChange(bookmarkTarget, nextBookmarked);
+            const finalBookmarked = Boolean(result?.bookmarked);
+            entry.bookmarked = finalBookmarked;
+            const delta = (finalBookmarked ? 1 : 0) - (previousBookmarked ? 1 : 0);
+            if (!delta) return;
+            didChange = true;
+            changedItems.push({
+                target: bookmarkTarget,
+                beforeBookmarked: previousBookmarked,
+                afterBookmarked: finalBookmarked,
+                parentConversationId: entry.parentConversationId || "",
+            });
+            if (entry.parentConversationId) {
+                conversationDeltas.set(
+                    entry.parentConversationId,
+                    (conversationDeltas.get(entry.parentConversationId) || 0) + delta
+                );
+            }
+        })
+    );
+    conversationDeltas.forEach((delta, convId) => {
+        updateConversationStarredPromptCount(convId, delta);
+    });
+    if (didChange) {
+        pushBookmarkUndoAction({
+            type: "bookmark-state",
+            items: changedItems,
+        });
+        renderTree();
+        refreshCurrentTabStrip();
+        if (isSidebarFilterActive) {
+            refreshDirectoryFromExtractFilters(true).catch(() => {});
+        }
+    }
+    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+        renderActiveTab();
+    } else {
+        syncStarredPromptSelectionClasses();
+    }
+}
+
+async function bulkSetSelectedStarredPrompts(nextBookmarked) {
+    const selectedEntries = getSelectedStarredPromptEntries();
+    if (!selectedEntries.length) return;
+    await applyStarredPromptBookmarkState(selectedEntries, nextBookmarked);
 }
 
 async function refreshSavedViews() {
@@ -6475,6 +8649,9 @@ function buildSavedViewDraftName(filters) {
     if (Array.isArray(nextFilters.model) && nextFilters.model.length > 0) {
         return `model: ${nextFilters.model[0]}`;
     }
+    if (Array.isArray(nextFilters.bookmarkTags) && nextFilters.bookmarkTags.length > 0) {
+        return `tag: ${nextFilters.bookmarkTags[0]}`;
+    }
     if (String(nextFilters.dateFrom || "").trim() || String(nextFilters.dateTo || "").trim()) {
         return `${nextFilters.dateFrom || "..."} -> ${nextFilters.dateTo || "..."}`;
     }
@@ -6541,25 +8718,18 @@ async function toggleStarredPromptCard(targetId, event) {
     event?.stopPropagation?.();
     const entry = (starredPromptEntries || []).find((item) => item.targetId === targetId);
     if (!entry) return;
-    const bookmarkTarget = buildBookmarkTargetSpec(entry.targetType, entry.targetId, entry.payload || {});
-    const currentState = getCachedBookmarkState(bookmarkTarget);
-    const previousBookmarked = Boolean(currentState?.bookmarked ?? (entry.bookmarked !== false));
-    const nextState = !previousBookmarked;
-    const result = await requestBookmarkChange(bookmarkTarget, nextState);
-    entry.bookmarked = Boolean(result?.bookmarked);
-    const previousCounted = previousBookmarked ? 1 : 0;
-    const nextCounted = entry.bookmarked ? 1 : 0;
-    if (previousCounted !== nextCounted && entry.parentConversationId) {
-        updateConversationStarredPromptCount(entry.parentConversationId, nextCounted - previousCounted);
-        renderTree();
-        refreshCurrentTabStrip();
-        if (isSidebarFilterActive) {
-            refreshDirectoryFromExtractFilters(true).catch(() => {});
-        }
+    const selectionKey = getStarredPromptEntrySelectionKey(entry);
+    if (event?.shiftKey && selectionKey) {
+        selectStarredPromptRange(selectionKey);
     }
-    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
-        renderActiveTab();
+    const selectedEntries = selectionKey && selectedStarredPromptKeys.includes(selectionKey)
+        ? getSelectedStarredPromptEntries()
+        : [];
+    if (selectedEntries.length > 1) {
+        await applyStarredPromptBookmarkState(selectedEntries, entry.bookmarked === false);
+        return;
     }
+    await applyStarredPromptBookmarkState([entry], entry.bookmarked === false);
 }
 
 function requestFilterOptions() {
@@ -6589,11 +8759,15 @@ function ensureExtractInteractions() {
         if (!target.closest("#extract-model-picker")) {
             closeExtractModelMenu();
         }
+        if (!target.closest("#extract-bookmark-tags-picker")) {
+            closeExtractBookmarkTagMenu();
+        }
     });
 
     document.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
             closeExtractModelMenu();
+            closeExtractBookmarkTagMenu();
         }
     });
 }
@@ -6614,6 +8788,8 @@ function populateExtractOptions(options) {
     }
     renderExtractModelMenu();
     syncExtractModelTrigger();
+    renderExtractBookmarkTagMenu();
+    syncExtractBookmarkTagTrigger();
     syncExtractSortButton();
 
     const sourceFileDatalist = document.getElementById("extract-source-file-options");
@@ -6670,6 +8846,7 @@ function hasActiveExtractFilters(filters) {
     return Boolean(
         (filters.service && filters.service.length) ||
         (filters.model && filters.model.length) ||
+        (filters.bookmarkTags && filters.bookmarkTags.length) ||
         EXTRACT_TEXT_FILTER_SPECS.some(({ key }) => String(filters[key] || "").trim()) ||
         normalizeBookmarkedFilterValue(filters.bookmarked) !== "all"
     );
@@ -6770,13 +8947,17 @@ function clearVirtualThreadFilters() {
     });
     writeExtractMultiValue("extract-service", []);
     writeExtractMultiValue("extract-model", []);
+    writeExtractMultiValue("extract-bookmark-tags", []);
     appliedExtractConversationIds = null;
     markTreeStructureDirty();
     syncExtractServiceButtons();
     renderExtractModelMenu();
     syncExtractModelTrigger();
+    renderExtractBookmarkTagMenu();
+    syncExtractBookmarkTagTrigger();
     syncExtractSortButton();
     closeExtractModelMenu();
+    closeExtractBookmarkTagMenu();
     scheduleVirtualThreadPreview();
     renderTree();
 }
@@ -6785,7 +8966,6 @@ async function openVirtualThreadFromFilters() {
     const filters = getExtractFilterState();
     await saveRecentFilterEntry(filters);
     await refreshRecentFilters();
-    openManagerTab("recent_filters");
 }
 
 async function applyCurrentFiltersToDirectory() {
@@ -6823,16 +9003,41 @@ async function applySavedFilterToDirectory(payload) {
     await applyStoredFilterToDirectory(payload);
 }
 
-function openRecentFiltersTab() {
-    openManagerTab("recent_filters");
-}
-
 function openStarredFiltersTab() {
     openManagerTab("starred_filters");
 }
 
 function openStarredPromptsTab() {
     openManagerTab("starred_prompts");
+}
+
+function isBookmarkGroupOpen(groupKey) {
+    return bookmarkGroupOpenByKey[groupKey] !== false;
+}
+
+function toggleBookmarkGroup(groupKey, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (!groupKey) return;
+    bookmarkGroupOpenByKey[groupKey] = !isBookmarkGroupOpen(groupKey);
+    if (getActiveTab()?.type === "manager" && getActiveTab()?.kind === "starred_prompts") {
+        renderActiveTab();
+    }
+}
+
+function toggleConversationTreeFromBadge(convIdx, event) {
+    if (Date.now() < bookmarkSelectionSuppressClickUntil) {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        return;
+    }
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (!Number.isInteger(convIdx) || convIdx < 0 || isAllTreesExpanded) return;
+    const isOpen = currentTreeConvIdx === convIdx;
+    currentTreeConvIdx = isOpen ? null : convIdx;
+    suppressedTreeAutoExpandConvIdx = isOpen ? convIdx : null;
+    renderTree();
 }
 
 function setupObserver() {
@@ -6876,6 +9081,7 @@ function renderTree() {
         document.activeElement !== treeRoot;
     const nextStructureSignature = getTreeStructureSignature();
     if (treeRoot.dataset.structureSignature === nextStructureSignature) {
+        syncDirectoryPromptSelectionClasses({ pruneToVisible: true });
         syncSidebarActiveStateToCurrentView({ scroll: false });
         return;
     }
@@ -6899,14 +9105,19 @@ function renderTree() {
         const convIdx = conv._idx;
         const result = getCurrentConversationResult(conv);
         const hitBadge = isSearch && result.hits > 0 ? `<span class="hit-badge">${result.hits} Hits</span> ` : "";
+        const shouldRenderPromptList = isAllTreesExpanded || currentTreeConvIdx === convIdx;
         const starredPromptCount = Number.isInteger(conv.starredPromptCount) ? conv.starredPromptCount : 0;
         const starBadge = getCountFolderBadgeHtml(
             starredPromptCount,
             getConversationSourceClass(conv),
             "thread-star-badge",
-            "Starred prompts in this thread"
+            shouldRenderPromptList ? "スレッドを閉じる" : "スレッドを開く",
+            {
+                expanded: shouldRenderPromptList,
+                interactive: true,
+                clickHandler: `toggleConversationTreeFromBadge(${convIdx}, event)`,
+            }
         );
-        const shouldRenderPromptList = isAllTreesExpanded || currentTreeConvIdx === convIdx;
         const previewItems = buildPromptPreviews(conv);
         const visiblePreviewItems = getVisibleDirectoryPreviewItems(previewItems, result, directoryFilterState);
 
@@ -6915,6 +9126,7 @@ function renderTree() {
             visiblePreviewItems.forEach((item) => {
                 const safeText = escapeHTML(item.preview || "");
                 const hasMatch = !isSearch || result.matchedMessageIndexes.includes(item.messageIndex);
+                const selectionKey = buildDirectoryPromptSelectionKey(conv.id, item.messageIndex);
                 const promptBookmarkTarget = buildPromptBookmarkTargetSpec(
                     conv,
                     item.messageIndex,
@@ -6922,12 +9134,15 @@ function renderTree() {
                 );
                 const promptBookmarkState = getCachedBookmarkState(promptBookmarkTarget);
                 promptsHtml += `
-                    <div class="prompt-item-row ${hasMatch ? "has-match" : "no-match"}">
-                        ${buildPromptBookmarkButtonHtml(
-                            promptBookmarkTarget,
-                            Boolean(promptBookmarkState?.bookmarked),
-                            `togglePromptBookmark(${convIdx}, ${item.messageIndex}, event)`,
-                            "prompt-nav-bookmark"
+                    <div
+                        class="prompt-item-row ${hasMatch ? "has-match" : "no-match"}"
+                        data-selection-key="${escapeHTML(selectionKey)}"
+                        data-directory-drop-kind="directory-prompt"
+                        data-directory-conv-idx="${convIdx}"
+                        data-directory-msg-idx="${item.messageIndex}"
+                    >
+                        ${buildPromptSidebarTagIndicatorHtml(
+                            Array.isArray(promptBookmarkState?.tags) && promptBookmarkState.tags.length > 0
                         )}
                         <button type="button"
                            class="prompt-item ${hasMatch ? "has-match" : "no-match"}"
@@ -6936,7 +9151,9 @@ function renderTree() {
                            data-item-type="prompt"
                            data-conv-idx="${convIdx}"
                            data-msg-idx="${item.messageIndex}"
+                           data-selection-key="${escapeHTML(selectionKey)}"
                            data-focus-key="prompt-${convIdx}-${item.messageIndex}"
+                           onpointerdown="armDirectoryPromptDrag(${convIdx}, ${item.messageIndex}, event)"
                            onclick="openPromptFromTree(event, ${convIdx}, ${item.messageIndex})">${safeText}...</button>
                     </div>`;
             });
@@ -6977,7 +9194,10 @@ function renderTree() {
                     tabindex="0"
                     data-item-type="conversation"
                     data-conv-idx="${convIdx}"
+                    data-directory-drop-kind="directory-folder"
+                    data-directory-conv-idx="${convIdx}"
                     data-focus-key="conv-${convIdx}"
+                    onpointerdown="armDirectoryFolderDrag(${convIdx}, event)"
                     onclick="openConversationFromTree(event, ${convIdx})"><span class="thread-title">${hitBadge}${starBadge}${escapeHTML(conv.title)}</span></summary>
                 <div class="prompt-list">${promptsHtml}</div>
             </details>`;
@@ -6989,6 +9209,7 @@ function renderTree() {
         treeRoot.innerHTML = htmlStr;
     }
     treeRoot.dataset.structureSignature = nextStructureSignature;
+    syncDirectoryPromptSelectionClasses({ pruneToVisible: true });
     if (shouldRestoreFocusedTreeItem) {
         restoreSidebarFocus();
     }
@@ -7035,8 +9256,21 @@ function jumpToMessage(convIdx, msgIdx, scrollBehavior = "smooth") {
 }
 
 function openPromptFromTree(event, convIdx, msgIdx) {
+    if (Date.now() < bookmarkSelectionSuppressClickUntil) {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        return;
+    }
+    const selectionKey = buildDirectoryPromptSelectionKey(chatData[convIdx]?.id || "", msgIdx);
+    if (event?.shiftKey && selectionKey) {
+        selectDirectoryPromptRange(selectionKey);
+        return;
+    }
     if (event && event.currentTarget) {
         rememberSidebarFocus(event.currentTarget);
+    }
+    if (selectionKey) {
+        clearDirectoryPromptSelection(selectionKey);
     }
     suppressedTreeAutoExpandConvIdx = null;
     ensureConversationTab(convIdx);
@@ -7065,6 +9299,11 @@ function scrollToTopAndSidebar(convIdx) {
 }
 
 function openConversationFromTree(event, convIdx, options = {}) {
+    if (Date.now() < bookmarkSelectionSuppressClickUntil) {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        return;
+    }
     if (event && event.currentTarget) {
         rememberSidebarFocus(event.currentTarget);
     }
@@ -7255,20 +9494,15 @@ async function renderChat(convIdx, options = {}) {
                 i,
                 prompt.text || ""
             );
-            const promptBookmarkState = getCachedBookmarkState(promptBookmarkTarget);
             const isPromptCollapsed = isMessageCollapsed(conv, i);
+            const promptTagBadgesHtml = buildPromptTagBadgesHtml(promptBookmarkTarget);
             html += `
                 <div class="chat-row user ${isPromptCollapsed ? "is-collapsed" : ""}" id="msg-${convIdx}-${i}">
                     ${buildMessageAvatarButtonHtml(convIdx, i, "user")}
                     <div class="bubble-wrapper">
                         <div class="prompt-meta-row">
+                            ${promptTagBadgesHtml ? `<div class="prompt-inline-tags">${promptTagBadgesHtml}</div>` : ""}
                             <div class="prompt-counter">Prompt ${promptCount}/${Math.max(1, totalPromptCount)}</div>
-                            ${buildPromptBookmarkButtonHtml(
-                                promptBookmarkTarget,
-                                Boolean(promptBookmarkState?.bookmarked),
-                                `togglePromptBookmark(${convIdx}, ${i}, event)`,
-                                "prompt-meta-bookmark"
-                            )}
                         </div>
                         <div class="bubble${isPromptCollapsed ? " bubble-collapsed-preview" : ""}">
                             <div class="prompt-bubble-layout">
@@ -7324,6 +9558,7 @@ async function renderChat(convIdx, options = {}) {
         }
     }
     isolateRenderedMath(viewer);
+    scheduleVisibleMathTypeset(viewer);
     enhanceCodeBlocks(viewer, { skipUserBubbles: true });
     refreshScrollFadeStates(viewer);
     playPendingTabReorderAnimation();
@@ -7356,6 +9591,9 @@ function renderVirtualThreadTab(tab) {
     (filters.model || []).forEach((value) => {
         chips.push(`<span class="extract-chip">model: ${escapeHTML(value)}</span>`);
     });
+    (filters.bookmarkTags || []).forEach((value) => {
+        chips.push(`<span class="extract-chip">tag: ${escapeHTML(value)}</span>`);
+    });
     [
         ["dateFrom", "from"],
         ["dateTo", "to"],
@@ -7370,9 +9608,9 @@ function renderVirtualThreadTab(tab) {
         }
     });
     if (normalizeBookmarkedFilterValue(filters.bookmarked) === "bookmarked") {
-        chips.push('<span class="extract-chip">bookmark: bookmarked only</span>');
+        chips.push('<span class="extract-chip">Tag: あり</span>');
     } else if (normalizeBookmarkedFilterValue(filters.bookmarked) === "not-bookmarked") {
-        chips.push('<span class="extract-chip">bookmark: not bookmarked</span>');
+        chips.push('<span class="extract-chip">Tag: なし</span>');
     }
 
     const items = Array.isArray(virtualThread.items) ? virtualThread.items : [];
@@ -7418,8 +9656,8 @@ function renderVirtualThreadTab(tab) {
                                         `toggleVirtualFragmentBookmark('${escapeJsString(tab.id)}', ${index}, event)`,
                                         "virtual-fragment-bookmark",
                                         {
-                                            activeTitle: "Virtual fragment bookmark is on",
-                                            inactiveTitle: "Bookmark this fragment",
+                                            activeTitle: "断片をマーク中",
+                                            inactiveTitle: "この断片をマーク",
                                         }
                                     )}
                                 </div>
@@ -7453,6 +9691,7 @@ function renderVirtualThreadTab(tab) {
     restorePendingTabStripFocus();
     revealActiveTabStripButton();
     isolateRenderedMath(viewer);
+    scheduleVisibleMathTypeset(viewer);
     enhanceCodeBlocks(viewer);
     playPendingTabReorderAnimation();
     applyTheme();
@@ -7475,12 +9714,12 @@ function renderManagerTab(tab) {
     if (scrollObserver) scrollObserver.disconnect();
 
     let bodyHtml = '<div class="extract-history-empty">表示できる内容がないよ</div>';
-    if (tab.kind === "recent_filters") {
-        bodyHtml = buildRecentFiltersMarkup();
-    } else if (tab.kind === "starred_filters") {
+    let controlsHtml = "";
+    if (tab.kind === "starred_filters") {
         bodyHtml = buildStarredFiltersMarkup();
     } else if (tab.kind === "starred_prompts") {
-        bodyHtml = buildStarredPromptsMarkup();
+        controlsHtml = buildStarredPromptManagerControlsHtml();
+        bodyHtml = buildBookmarkTagWorkspaceMarkup();
     }
 
     viewer.innerHTML = `
@@ -7489,6 +9728,7 @@ function renderManagerTab(tab) {
             <div class="virtual-thread-meta top-inline">
                 <h2 class="manager-tab-heading">${escapeHTML(tab.title || "Manager")}</h2>
             </div>
+            ${controlsHtml}
             <div class="extract-history-list manager-tab-list">
                 ${bodyHtml}
             </div>
@@ -7502,6 +9742,9 @@ function renderManagerTab(tab) {
     applyTheme();
     refreshUtilityToggleButtons();
     updateToolbarCollapse();
+    if (tab.kind === "starred_prompts") {
+        syncStarredPromptSelectionClasses({ pruneToVisible: true });
+    }
 }
 
 function setVirtualFragmentActiveIndex(index, options = {}) {
@@ -8023,7 +10266,7 @@ async function executeSearch() {
 async function bootViewer(options = {}) {
     try {
         debugPerfLog("boot:start");
-        ensureRenderer();
+        await initMathJaxRuntime({ timeoutMs: 2200 });
         debugPerfLog("boot:renderer-ready");
         initBridge();
         debugPerfLog("boot:bridge-init");
@@ -8095,11 +10338,16 @@ async function bootViewer(options = {}) {
             viewer.addEventListener("scroll", () => {
                 captureActiveVirtualTabScrollState(viewer);
                 scheduleConversationRootDockUpdate();
+                scheduleVisibleMathTypeset(viewer);
             }, { passive: true });
         }
+        window.addEventListener("resize", () => {
+            scheduleVisibleMathTypeset(document.getElementById("chat-viewer"));
+        }, { passive: true });
         ensureTabMouseDragInteractions();
         ensureViewerToolsInteractions();
         ensureExtractInteractions();
+        ensureBookmarkSelectionDragInteractions();
         ensureTabStripKeyboardNavigation();
         ensureSidebarKeyboardNavigation();
         ensureHiddenSidebarKeyboardNavigation();
@@ -8112,6 +10360,8 @@ async function bootViewer(options = {}) {
         debugPerfLog("boot:after-filter-options");
         await refreshStarredFilters();
         debugPerfLog("boot:after-starred-filters");
+        await refreshBookmarkTags();
+        debugPerfLog("boot:after-bookmark-tags");
         await refreshStarredPrompts();
         debugPerfLog("boot:after-starred-prompts");
         await refreshRecentFilters();

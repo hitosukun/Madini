@@ -46,12 +46,14 @@ from app_paths import TEMP_HTML, USER_DATA_DIR, VIEWER_INDEX_JS
 from archive_store import (
     build_virtual_thread,
     build_virtual_thread_preview,
+    create_bookmark_tag,
+    delete_bookmark_tag,
     delete_saved_view,
     delete_starred_filter,
     ensure_user_data_dir,
     fetch_bookmark_states,
     fetch_filter_options,
-    list_bookmarks,
+    list_bookmark_tags,
     list_starred_filters,
     list_starred_prompts,
     fetch_conversation_raw_source,
@@ -66,6 +68,7 @@ from archive_store import (
     save_saved_view,
     save_starred_filter,
     search_conversations_for_spec,
+    set_bookmark_tag_membership,
     set_bookmark,
 )
 from viewer_builder import build_viewer_html, build_viewer_index_script
@@ -91,7 +94,7 @@ class CustomWebEnginePage(QWebEnginePage):
         self.log_callback = log_callback
 
     def javaScriptConsoleMessage(self, level, message, line_number, source_id):
-        if "MathJax" not in message and "IMKC" not in message:
+        if "IMKC" not in message:
             self.log_callback(f"🐛 [ブラウザ]: {message}")
 
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):
@@ -245,8 +248,39 @@ class ViewerBridge(QObject):
         return json.dumps(result, ensure_ascii=False)
 
     @pyqtSlot(result=str)
-    def fetchBookmarks(self):
-        return json.dumps(list_bookmarks(), ensure_ascii=False)
+    def fetchBookmarkTags(self):
+        return json.dumps(list_bookmark_tags(), ensure_ascii=False)
+
+    @pyqtSlot(str, result=str)
+    def createBookmarkTag(self, payload):
+        try:
+            params = json.loads(payload)
+        except json.JSONDecodeError:
+            params = {}
+        result = create_bookmark_tag(params.get("name"))
+        return json.dumps(result or {}, ensure_ascii=False)
+
+    @pyqtSlot(str, result=str)
+    def setBookmarkTagMembership(self, payload):
+        try:
+            params = json.loads(payload)
+        except json.JSONDecodeError:
+            params = {}
+        result = set_bookmark_tag_membership(
+            params.get("tagId"),
+            params.get("targets"),
+            params.get("assigned"),
+        )
+        return json.dumps(result or {}, ensure_ascii=False)
+
+    @pyqtSlot(str, result=str)
+    def deleteBookmarkTag(self, payload):
+        try:
+            params = json.loads(payload)
+        except json.JSONDecodeError:
+            params = {}
+        result = delete_bookmark_tag(params.get("tagId"))
+        return json.dumps(result or {}, ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
     def searchConversations(self, payload):

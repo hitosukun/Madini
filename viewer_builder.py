@@ -144,6 +144,7 @@ def build_viewer_html(conversations, user_themes=None, system_theme="light", sho
     css_text = _read_text(ASSET_DIR / "style.css")
     css_text += "\n" + _read_text(ASSET_DIR / "math.css")
     js_text = _read_text(ASSET_DIR / "viewer.js")
+    mathjax_text = _read_text(ASSET_DIR / "mathjax-tex-chtml.js")
 
     if CUSTOM_CSS.exists():
         css_text += "\n" + _read_text(CUSTOM_CSS)
@@ -160,6 +161,21 @@ def build_viewer_html(conversations, user_themes=None, system_theme="light", sho
     boot_options = _escape_json(
         {"systemTheme": system_theme, "showToast": show_toast}
     )
+    mathjax_config = """
+window.MathJax = {
+    startup: { typeset: false },
+    tex: {
+        inlineMath: [['\\\\(', '\\\\)']],
+        displayMath: [['\\\\[', '\\\\]']],
+        processEscapes: true
+    },
+    options: {
+        skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+        processHtmlClass: 'math-inline|math-display',
+        ignoreHtmlClass: 'tex2jax_ignore|ignore-mathjax'
+    }
+};
+""".strip()
 
     return f"""<!DOCTYPE html>
 <html>
@@ -167,6 +183,8 @@ def build_viewer_html(conversations, user_themes=None, system_theme="light", sho
 <meta charset="utf-8">
 <style>{css_text}</style>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script>{mathjax_config}</script>
+<script>{mathjax_text}</script>
 </head>
 <body>
 <div id="sidebar">
@@ -220,6 +238,18 @@ def build_viewer_html(conversations, user_themes=None, system_theme="light", sho
                 </div>
                 <div class="extract-grid">
                     <div class="extract-field extract-field-wide">
+                        <span>Tag</span>
+                        <input type="hidden" id="extract-bookmarked" value="all">
+                        <input type="hidden" id="extract-bookmark-tags" value="[]">
+                        <div id="extract-bookmark-tags-picker" class="extract-model-picker">
+                            <button id="extract-bookmark-tags-trigger" class="extract-picker-trigger" type="button" onclick="toggleExtractBookmarkTagMenu(event)">
+                                <span id="extract-bookmark-tags-trigger-label">タグを選ぶ</span>
+                                <span class="extract-picker-caret" aria-hidden="true"></span>
+                            </button>
+                            <div id="extract-bookmark-tags-menu" class="extract-model-menu"></div>
+                        </div>
+                    </div>
+                    <div class="extract-field extract-field-wide">
                         <span>service</span>
                         <input type="hidden" id="extract-service" value="[]">
                         <div id="extract-service-buttons" class="extract-service-buttons"></div>
@@ -266,15 +296,16 @@ def build_viewer_html(conversations, user_themes=None, system_theme="light", sho
                         <input type="text" id="extract-source-file" list="extract-source-file-options" oninput="scheduleVirtualThreadPreview()">
                         <datalist id="extract-source-file-options"></datalist>
                     </label>
-                    <label class="extract-field">
-                        <span>starred prompts</span>
-                        <select id="extract-bookmarked" onchange="scheduleVirtualThreadPreview()">
-                            <option value="all">all</option>
-                            <option value="bookmarked">has starred prompt</option>
-                            <option value="not-bookmarked">without starred prompt</option>
-                        </select>
-                    </label>
                 </div>
+                <section class="extract-history-section">
+                    <div class="extract-history-header">
+                        <div class="extract-history-heading">
+                            <h3><span class="tab-button-kind tab-button-kind-icon tab-button-kind-clock extract-history-title-icon" aria-hidden="true"></span><span>履歴</span></h3>
+                            <div class="extract-history-note">直近10件だけをここに表示するよ</div>
+                        </div>
+                    </div>
+                    <div id="extract-history-list" class="extract-history-list"></div>
+                </section>
             </div>
         </div>
     </div>
