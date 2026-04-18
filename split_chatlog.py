@@ -324,6 +324,85 @@ def parse_chatgpt_export(data):
     return conversations
 
 
+CLAUDE_TOOL_PLACEHOLDER = "```\nThis block is not supported on your current device yet.\n```"
+
+
+def _summarize_claude_tool_input(name, inputs):
+    """Pick the most informative single-key value from a Claude `tool_use`
+    input dict. Falls back to listing input keys when nothing scalar-ish
+    fits. Output is intentionally short — tool blocks are rendered inline
+    and shouldn't dominate the message body."""
+    if not isinstance(inputs, dict) or not inputs:
+        return ""
+    PRIORITIZED_KEYS = ("query", "url", "path", "title", "name", "command", "code", "text")
+    for key in PRIORITIZED_KEYS:
+        value = inputs.get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            text = str(value).strip()
+            if len(text) > 140:
+                text = text[:140].rstrip() + "…"
+            return f"{key}: {text}"
+    keys = [k for k in list(inputs.keys())[:4] if k]
+    return f"inputs: {', '.join(keys)}" if keys else ""
+
+
+def _format_claude_tool_block(item):
+    """Render a single `tool_use` or `tool_result` content item as a short
+    Markdown blockquote. Used to replace Claude's export-side placeholder
+    string ('This block is not supported on your current device yet.')
+    with the actual tool name + a brief input summary, so the user can
+    see which tool ran instead of an opaque stub."""
+    if not isinstance(item, dict):
+        return CLAUDE_TOOL_PLACEHOLDER
+    kind = item.get("type")
+    name = (item.get("name") or "unknown").strip() or "unknown"
+    if kind == "tool_use":
+        summary = _summarize_claude_tool_input(name, item.get("input"))
+        return f"> 🔧 **{name}** — {summary}" if summary else f"> 🔧 **{name}**"
+    if kind == "tool_result":
+        if item.get("is_error"):
+            msg = item.get("message") or "tool returned an error"
+            return f"> ⚠️ **{name}** failed — {str(msg)[:120]}"
+        # Successful tool_result is mostly redundant once the tool_use
+        # above has already surfaced what ran. Drop it to keep the
+        # message readable instead of doubling every tool with a
+        # confirmation line.
+        return ""
+    return CLAUDE_TOOL_PLACEHOLDER
+
+
+def _build_claude_message_text(message):
+    """Replace each `This block is not supported on your current device yet.`
+    placeholder fence-block in `message.text` with a contextual summary
+    pulled from the matching item in `message.content[]`. Claude's
+    export embeds the placeholder once per `tool_use` and once per
+    `tool_result` — we walk both arrays in lockstep so the i-th
+    placeholder gets the i-th tool block's summary. When the counts don't
+    match (defensive — never seen in practice), surplus placeholders are
+    left as-is rather than risk grafting a wrong tool's name onto an
+    unrelated block."""
+    text = (message.get("text") or "").strip()
+    if not text or CLAUDE_TOOL_PLACEHOLDER not in text:
+        return text
+    content = message.get("content") or []
+    tool_blocks = [
+        item for item in content
+        if isinstance(item, dict) and item.get("type") in ("tool_use", "tool_result")
+    ]
+    parts = text.split(CLAUDE_TOOL_PLACEHOLDER)
+    rebuilt = parts[0]
+    for i, tail in enumerate(parts[1:]):
+        if i < len(tool_blocks):
+            replacement = _format_claude_tool_block(tool_blocks[i])
+        else:
+            replacement = CLAUDE_TOOL_PLACEHOLDER
+        rebuilt += replacement + tail
+    # Empty replacements (successful tool_result) leave bare blank lines
+    # behind. Collapse 3+ newlines back to a paragraph break so the
+    # resulting Markdown doesn't render with huge gaps.
+    return re.sub(r"\n{3,}", "\n\n", rebuilt).strip()
+
+
 def parse_claude_export(data):
     conversations = []
     for conv in data:
@@ -338,7 +417,7 @@ def parse_claude_export(data):
             timestamp = _format_timestamp(message.get("created_at"))
             if timestamp:
                 message_timestamps.append(timestamp)
-            text = message.get("text", "").strip()
+            text = _build_claude_message_text(message)
             if role and text:
                 messages.append({"role": role, "text": text})
 
